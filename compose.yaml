@@ -1,0 +1,42 @@
+name: phishshield-local
+services:
+  app:
+    image: phishshield:1.0.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # The root .env remains valid for native use; only container routing is overridden.
+      PHISHSHIELD_DATABASE_URL: postgresql+psycopg://phishshield@postgres:5432/phishshield
+      PHISHSHIELD_LLM_ALLOW_DOCKER_HOST_HTTP: "true"
+      PHISHSHIELD_ENABLE_TEST_SIMULATION: "0"
+    ports:
+      - "127.0.0.1:8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 20s
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: phishshield
+      POSTGRES_DB: phishshield
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phishshield -d phishshield"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - development-db:/var/lib/postgresql/data
+volumes:
+  development-db:

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="PhishShield 本機郵件分析工作台：匯入 EML 與 TXT，對照原文、釣魚訊號與模型分析證據。">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="color-scheme" content="light">
+  <title>PhishShield｜郵件風險分析工作台</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/doodle.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link button-md" href="#main-content">跳至主要內容</a>
+<header class="topbar">
+  <a class="brand title-1" href="/" aria-label="PhishShield 首頁"><span class="brand-mark" aria-hidden="true">P</span><span>PhishShield</span></a>
+  <nav class="tabs" aria-label="工作區"><button id="tab-analyze" type="button" class="tab active" aria-current="page" aria-controls="analyze-view">分析郵件</button><button id="tab-history" type="button" class="tab" aria-current="false" aria-controls="history-view">分析紀錄</button></nav>
+  <span id="health" class="health caption-4" role="status">檢查服務中</span>
+</header>
+<main id="main-content" tabindex="-1">
+  <div class="heading">
+    <div><h1 id="workspace-title" class="heading-3">郵件分析筆記</h1><p id="workspace-intro" class="intro body-6">匯入信件，對照原文與分析證據。</p></div>
+    <img class="crayon-art" src="/assets/crayon-mail.png" alt="" width="260" height="136">
+  </div>
+  <section id="analyze-view" class="workspace" aria-label="分析郵件">
+    <article class="card input-card" aria-labelledby="import-title">
+      <div class="card-title"><div><h2 id="import-title" class="heading-6">匯入信件</h2></div></div>
+      <div id="model-connection" class="model-connection"><p id="model-connection-status" class="caption-2" role="status" aria-live="polite">正在檢查 AI 連線…</p><button id="check-model" type="button" class="text-button">重新檢查連線</button></div>
+      <form id="analysis-form">
+
+        <div class="import-fields">
+          <div class="input-tabs" role="tablist" aria-label="匯入方式">
+            <button id="input-tab-file" type="button" class="reading-tab input-tab" role="tab" aria-selected="true" aria-controls="input-panel-file" tabindex="0">上傳檔案</button>
+            <button id="input-tab-text" type="button" class="reading-tab input-tab" role="tab" aria-selected="false" aria-controls="input-panel-text" tabindex="-1">貼上文字</button>
+          </div>
+          <section id="input-panel-file" class="input-panel" role="tabpanel" aria-labelledby="input-tab-file">
+          <label for="email-file" class="title-4">選擇信件檔案 <span class="muted caption-4">每個 2 MB</span></label>
+          <input id="email-file" type="file" accept=".eml,.txt" multiple aria-describedby="file-help">
+          <p id="file-help" class="caption-2 field-help">可混合選擇 EML 與 UTF-8 TXT。每個檔案視為一封信，合計上限 20 MB。</p>
+          <button type="button" id="clear-file" class="text-button" hidden>清除選檔</button>
+          <section id="batch-area" class="batch-area" hidden aria-label="批次信件清單"><p class="caption-2">批次清單 · 最多 20 個檔案</p><p id="batch-status" class="caption-2" role="status" aria-live="polite"></p><progress id="batch-progress" max="1" value="0" aria-label="批次分析進度"></progress><div id="batch-list"></div><button id="export-batch" type="button" class="secondary" disabled>下載本批報告（單一 PDF）</button><button id="batch-stop" type="button" class="secondary" hidden>停止待處理（目前這封會完成）</button></section>
+        </section>
+        <section id="input-panel-text" class="input-panel" role="tabpanel" aria-labelledby="input-tab-text" hidden>
+          <label for="email-text" class="title-4">郵件文字</label>
+          <textarea id="email-text" rows="5" placeholder="貼上要分析的郵件內容…" spellcheck="false" aria-describedby="text-help"></textarea>
+          <p id="text-help" class="caption-2 field-help">網址與 HTML 標記僅以文字顯示。</p>
+          </section>
+        </div>
+        <div class="submit-row analysis-actions"><button id="submit-analysis" class="primary" type="submit"><span id="submit-label">開始分析</span></button><button id="new-analysis" type="button" class="secondary button-md" hidden>開始新的分析</button><a class="jump-link button-sm" href="#reading-workspace">閱讀結果</a></div>
+        <p id="form-status" class="form-status caption-2" role="status" aria-live="polite"></p>
+      </form>
+    </article>
+    <div id="reading-workspace" class="reading-column card reading-workspace" tabindex="-1">
+      <div class="report-toolbar"><div class="reading-tabs" role="tablist" aria-label="信件與分析">
+        <button id="reading-tab-mail" type="button" class="reading-tab" role="tab" aria-selected="true" aria-controls="reading-panel-mail" tabindex="0">信件與結果</button>
+        <button id="reading-tab-result" type="button" class="reading-tab" role="tab" aria-selected="false" aria-controls="reading-panel-result" tabindex="-1">詳細結果</button>
+      </div>
+      <button id="export-current" type="button" class="secondary" disabled>下載 PDF</button></div>
+      <div id="analysis-activity" class="analysis-activity" role="status" aria-live="polite" hidden><span class="activity-spinner" aria-hidden="true"></span><div><strong id="activity-label">處理中，請稍候</strong><p>請稍候，內容將在下方顯示。</p></div></div>
+      <p id="export-status" class="caption-2" role="status" aria-live="polite"></p>
+      <article id="reading-panel-mail" class="reading-panel overview-panel" role="tabpanel" aria-labelledby="reading-tab-mail">
+        <section class="overview-mail" aria-label="信件預覽"><div class="card-title"><div><h2 class="heading-6">信件預覽</h2><p id="preview-status" class="caption-2" role="status" aria-live="polite">匯入後即可對照郵件原文。</p></div></div><div id="mail-preview"><div class="preview-empty"><span class="empty-symbol" aria-hidden="true"></span><p class="body-6">選擇檔案或貼上內容，即可閱讀原文。</p></div></div></section>
+        <section class="overview-result" aria-label="分析結果"><div class="card-title"><div><h2 class="heading-6">分析結果</h2></div></div><div id="result" aria-live="polite"><div class="empty-state"><span class="empty-symbol" aria-hidden="true"></span><h3 class="title-3">等待第一封郵件</h3><p class="body-6">開始分析後，這裡會呈現分類、<br>主要訊號與執行狀態。</p><span class="small-tag caption-2">尚未分析，不代表安全或不安全</span></div></div></section>
+      </article>
+      <article id="reading-panel-result" class="result-card reading-panel" role="tabpanel" aria-labelledby="reading-tab-result" hidden><div class="card-title"><div><h2 class="heading-6">詳細結果</h2><p class="caption-2">了解判斷理由、對照證據與確認下一步。</p></div></div><div id="result-details"><div class="empty-state"><h3 class="title-3">讓每個結論都有依據</h3><p class="body-6">完成分析後，再切換查看理由與證據。</p></div></div></article>
+    </div>
+  </section>
+  <section id="history-view" hidden aria-label="分析紀錄"><article class="card history-card"><div class="history-title"><div><h2 class="heading-6">分析紀錄</h2><p class="caption-2">重看結果、原文與證據。舊紀錄可能未保存原文。</p></div><button id="refresh-history" type="button" class="secondary">重新整理</button></div><form id="history-search" class="history-filters" aria-label="搜尋分析紀錄">
+<label>關鍵字<input id="history-query" type="search" maxlength="100" placeholder="主旨、寄件者、內文或判斷摘要"></label>
+<label>開始日期<input id="history-from" type="date"></label><label>結束日期<input id="history-to" type="date"></label>
+<div class="filter-actions"><button type="submit" class="primary">搜尋</button><button id="clear-search" type="button" class="secondary">清除</button></div>
+</form>
+<div class="history-export"><label class="checkbox-label"><input id="select-page" type="checkbox">選取本頁</label><span id="selection-count" class="caption-2">已選 0 份</span><label class="export-format-label">下載格式<select id="export-format"><option value="pdf">所有選取信件 → 一份 PDF</option><option value="zip">每封一份 PDF → ZIP 壓縮檔</option></select></label><button id="export-selected" type="button" class="secondary" disabled>下載所選報告</button></div>
+<p id="export-format-note" class="note">先勾選信件，再下載報告。每次最多 20 封，可跨頁選取。</p>
+<p id="history-export-status" class="caption-2" role="status" aria-live="polite"></p>
+<p id="history-status" class="caption-2" role="status" aria-live="polite"></p><div class="table-scroll" role="region" aria-label="歷史分析列表"><table role="table"><thead><tr><th scope="col">時間（台北）</th><th scope="col">模型分析</th><th scope="col">分類</th><th scope="col">分析模式</th><th scope="col">查看</th></tr></thead><tbody id="history-body"></tbody></table></div><div class="pagination"><label class="page-size-label">每頁顯示<select id="page-size" aria-label="每頁顯示筆數"><option value="10">10 筆</option><option value="20">20 筆</option><option value="50">50 筆</option><option value="100">100 筆</option></select></label><label class="page-select-label">前往<select id="page-select" aria-label="選擇頁數"><option value="1">第 1 頁</option></select></label><button id="previous-page" type="button" class="secondary">上一頁</button><span id="page-label" class="caption-2"></span><button id="next-page" type="button" class="secondary">下一頁</button></div></article></section>
+  <section class="help-notes" aria-label="使用與資料說明"><details id="privacy" class="privacy"><summary class="title-4">本機保存與隱私</summary><p class="caption-2">本機保存原始檔文字、解碼正文與證據，供重新開啟紀錄時判讀。通過驗證的模型特徵與理由也會保存；選用遠端 AI 時，郵件會送至設定的供應商。請僅在受控環境測試。</p></details><details id="usage-note" class="usage-note"><summary class="caption-4">使用範圍與限制</summary><p class="caption-2">分析結果不構成絕對安全保證。交由人員判斷表示目前沒有足夠依據形成結論，不表示已經人工審批。此版本為本機測試工具，尚未提供跨使用者權限與資料自動清理。</p></details></section>
+  <footer class="caption-4"><span id="version-note">PhishShield 1.0.0</span><div><a id="privacy-link" href="#privacy">資料保存說明</a><a id="usage-link" href="#usage-note">使用說明</a></div></footer>
+
+</main>
+</body>
+</html>
