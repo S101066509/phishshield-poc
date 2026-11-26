@@ -23,14 +23,35 @@ const modelReasons={
   INVALID_RULE_INPUT:'規則輸入無效',RULE_EVALUATION_FAILED:'規則未完成',
   ANALYSIS_SERVICE_FAILED:'分析服務失敗'
 };
+const truncatedOutputCopy='模型輸出達長度上限，回覆未完成；這次未採用模型判斷，請先對照信件與既有證據。';
+function isOutputTruncated(data){
+  if(data.status!=='FAILED'||data.model_analysis?.activated===false||data.model_analysis?.completed===true)return false;
+  if(data.errors!==undefined&&!Array.isArray(data.errors))return false;
+  const errors=data.errors||[];
+  const codes=errors.length?errors.map(item=>item?.code):data.model_analysis?.reason_codes;
+  if(!Array.isArray(codes)||!codes.includes('LLM_OUTPUT_INVALID'))return false;
+  const envelope=data.model_diagnostics;
+  let diagnostic=envelope?.diagnostic;
+  if(diagnostic==null&&Array.isArray(envelope?.calls)){
+    const call=envelope.calls[envelope.calls.length-1];
+    if(['a','b'].includes(envelope.failed_stage)&&call?.stage===envelope.failed_stage&&call.error_code==='LLM_OUTPUT_INVALID')diagnostic=call.diagnostic;
+  }
+  return diagnostic?.reason==='output_truncated'&&diagnostic.finish_reason==='length'&&
+    (diagnostic.category==null||diagnostic.category==='output_truncated');
+}
+function analysisErrorText(data,code,fallback){
+  return code==='LLM_OUTPUT_INVALID'&&isOutputTruncated(data)?truncatedOutputCopy:
+    reasons[code]||modelReasons[code]||fallback;
+}
 function modelState(data){
   const info=data.model_analysis;
   const codes=Array.isArray(info?.reason_codes)?info.reason_codes:[];
   if(data.simulation===true||codes.includes('SIMULATED_ANALYSIS'))return {label:'離線模擬',reason:'沒有呼叫真實模型。'};
   if(!info||typeof info.activated!=='boolean'||typeof info.completed!=='boolean'||(info.completed&&!info.activated))return {label:'未記錄',reason:'此筆紀錄未保存完整、可判讀的模型狀態。'};
   if(info.completed)return {label:'已完成',reason:'AI 已完成分析，回覆與引用原文已通過系統核對。'};
-  const reason=(!info.activated&&info.skipped_by_rules===true)?'依規則政策跳過':codes.map(code=>modelReasons[code]).find(Boolean)||'原因未記錄';
-  return {label:(info.activated?'未完成':'未啟用')+' · '+reason,reason:info.activated?'AI 已開始分析，但尚未取得可採用的完整回覆。':'模型流程沒有啟動。'};
+  const truncated=isOutputTruncated(data);
+  const reason=(!info.activated&&info.skipped_by_rules===true)?'依規則政策跳過':truncated?'輸出達長度上限':codes.map(code=>modelReasons[code]).find(Boolean)||'原因未記錄';
+  return {label:(info.activated?'未完成':'未啟用')+' · '+reason,reason:info.activated?(truncated?truncatedOutputCopy:'AI 已開始分析，但尚未取得可採用的完整回覆。'):'模型流程沒有啟動。'};
 }
 function modelLabel(data){return modelState(data).label;}
 function renderModelAnalysis(data){
@@ -39,13 +60,14 @@ function renderModelAnalysis(data){
   block.append(element('p',modelLabel(data),'badge'),element('p',modelState(data).reason,'note'));
   if(!info)return;
 
-  for(const text of [...new Set((info.reason_codes||[]).map(code=>reasons[code]).filter(Boolean))])block.append(element('p',text,'note'));
+  for(const text of [...new Set((info.reason_codes||[]).map(code=>code==='LLM_OUTPUT_INVALID'&&isOutputTruncated(data)?truncatedOutputCopy:reasons[code]).filter(Boolean))])block.append(element('p',text,'note'));
   if(info.rules_matched)block.append(element('p',info.skipped_by_rules?'本次採用既有檢查結果，未送交 AI 分析。':'文字檢查發現需留意的內容，本次也已啟動 AI 分析。','note'));
 }
 const reasons = {UNKNOWN:'需交由人員判斷，目前資訊不足以判定風險。',MODEL_ANALYSIS_COMPLETED:'模型分析已完成並通過輸出驗證。',MODEL_NOT_STARTED:'尚未開始模型分析。',SIMULATED_ANALYSIS:'此為離線模擬，不構成真實郵件判斷。',EVIDENCE_INSUFFICIENT:'證據或資訊不足。',REVIEW_REQUIRED:'以下項目需交由人員判斷。',MODEL_RECOMMENDATION:'採用經驗證的模型建議。',TRUSTED_MALICIOUS_URL:'命中已驗證且有效的可信網址情報。',LLM_NOT_CONFIGURED:'尚未設定 AI 服務，請完成環境變數設定並重新啟動後台。',LLM_TIMEOUT:'模型分析逾時，未成功完成。',LLM_ENDPOINTS_OFFLINE:'AI 服務離線，此階段的端點已全部嘗試且無法使用。請稍後重新檢查連線。',LLM_TEST_MODE_DISABLED:'離線模擬僅供測試工具，請配置可用 AI。',LLM_CONNECTION_LOST:'模型連線中斷，重試後仍未完成。',LLM_RECONNECT_FAILED:'無法清理或重建連線，分析已停止。',LLM_OUTPUT_INVALID:'模型輸出格式無效，結果未採用。',LLM_EVIDENCE_INVALID:'AI 引用的原文未通過核對，這次未採用完整模型結論。請對照原文或重新分析。',EMPTY_INPUT:'沒有可分析的內容。',MODEL_REASON_REDACTED:'模型另有分析理由；自由文字未保存。'};
 let inputMode='file';
 let busy=false,page=1,pageSize=10,total=0,sourceMode='new',historySequence=0;
 let currentReport=null, exportBusy=false;
+let busyClockTimer,busyStartedAt=0,busyClockScope='',analysisPreviewReady=false;
 const selectedReports=new Set();
 const historyCheckboxes=new Map();
 let historyItems=[], historyFilters={};
@@ -57,7 +79,39 @@ function loadingState(message){
   return node;
 }
 function clearResultDetails(){currentReport=null;$('export-status').textContent='';updateExportControls();$('result-details').replaceChildren(element('p','尚未取得詳細結果；請先完成分析。','note'));}
-function setBusy(value,message=''){busy=value;if(value)$('activity-label').textContent=message||'處理中，請稍候';$('analysis-activity').hidden=!value;$('analyze-view').classList.toggle('is-processing',value);if(value)clearResultDetails();for(const id of ['email-file','email-text','input-tab-file','input-tab-text','clear-file','check-model','tab-history'])$(id).disabled=value||(sourceMode==='history'&&['email-file','email-text','input-tab-file','input-tab-text','clear-file'].includes(id))||(id==='check-model'&&modelCheckRunning)||(id==='email-text'&&inputMode!=='text')||(id==='email-file'&&inputMode!=='file');$('result').setAttribute('aria-busy',String(value));$('result-details').setAttribute('aria-busy',String(value));$('new-analysis').hidden=sourceMode!=='history';$('new-analysis').disabled=value;$('submit-analysis').disabled=value||sourceMode==='history';$('submit-analysis').hidden=sourceMode==='history';$('submit-label').textContent=value?'處理中…':sourceMode==='history'?'歷史紀錄檢視中':'開始分析';$('submit-analysis').setAttribute('aria-busy',String(value));$('form-status').className='form-status';$('form-status').textContent=message;}
+function stopBusyClock(){
+  clearTimeout(busyClockTimer);busyClockTimer=undefined;busyClockScope='';
+  $('activity-elapsed').hidden=true;$('activity-elapsed').textContent='';
+}
+function updateBusyClock(){
+  if(!busy||!busyClockScope)return;
+  const elapsed=Math.max(0,Math.floor((Date.now()-busyStartedAt)/1000));
+  $('activity-elapsed').textContent=(busyClockScope==='batch'?'本批已等待 ':'已等待 ')+elapsed+' 秒';
+  $('activity-detail').textContent=elapsed>=30?'尚未收到完整分析結果，請保留目前頁面，避免重複提交。':
+    busyClockScope==='batch'?'正在等候目前這封信的完整結果，其餘檔案將依序送出。':
+    analysisPreviewReady?'初步文字檢查已完成，正在等候完整分析結果。':'完整分析等待中，尚未取得最終判斷。';
+}
+function startBusyClock(){
+  analysisPreviewReady=false;
+  if(sourceMode==='history'){$('activity-detail').textContent='正在讀取已保存的紀錄。';return;}
+  busyStartedAt=Date.now();busyClockScope=batchRunning?'batch':'analysis';
+  $('activity-elapsed').hidden=false;updateBusyClock();
+  const tick=()=>{if(!busy||!busyClockScope)return;updateBusyClock();busyClockTimer=setTimeout(tick,1000);};
+  busyClockTimer=setTimeout(tick,1000);
+}
+function setBusy(value,message=''){
+  stopBusyClock();busy=value;
+  if(value)$('activity-label').textContent=message||'處理中，請稍候';
+  $('analysis-activity').hidden=!value;$('analyze-view').classList.toggle('is-processing',value);
+  if(value)clearResultDetails();
+  for(const id of ['email-file','email-text','input-tab-file','input-tab-text','clear-file','check-model','tab-history'])$(id).disabled=value||(sourceMode==='history'&&['email-file','email-text','input-tab-file','input-tab-text','clear-file'].includes(id))||(id==='check-model'&&modelCheckRunning)||(id==='email-text'&&inputMode!=='text')||(id==='email-file'&&inputMode!=='file');
+  $('result').setAttribute('aria-busy',String(value));$('result-details').setAttribute('aria-busy',String(value));
+  $('new-analysis').hidden=sourceMode!=='history';$('new-analysis').disabled=value;
+  $('submit-analysis').disabled=value||sourceMode==='history';$('submit-analysis').hidden=sourceMode==='history';
+  $('submit-label').textContent=value?'處理中…':sourceMode==='history'?'歷史紀錄檢視中':'開始分析';
+  $('submit-analysis').setAttribute('aria-busy',String(value));$('form-status').className='form-status';$('form-status').textContent=message;
+  if(value)startBusyClock();
+}
 function showTab(name){
   for(const tab of ['analyze','history']){
     $(tab+'-view').hidden=tab!==name;
@@ -111,9 +165,9 @@ for(const [index,name] of readingTabs.entries()){
     event.preventDefault();showReadingTab(readingTabs[next],true);
   });
 }
-async function request(path,options={}){const controller=new AbortController();const waitLimit=options.method==='POST'&&/^\/api\/v1\/analyses(?:\/file)?$/.test(path)?310000:65000;const timer=setTimeout(()=>controller.abort(),waitLimit);try{const response=await fetch(path,{...options,signal:controller.signal,cache:'no-store'});let data;try{data=await response.json();}catch{throw new Error('服務回覆無效，請確認服務狀態。');}if(!response.ok&&!data.analysis_id)throw new Error(reasons[data.error_code]||'請求未成功完成，請確認輸入、資料庫及服務狀態。');return data;}catch(error){if(error.name==='AbortError')throw new Error('連線等待逾時，未取得結果；請檢查服務後重試。');throw error;}finally{clearTimeout(timer);}}
+async function request(path,options={}){const controller=new AbortController();const waitLimit=options.method==='POST'&&/^\/api\/v1\/analyses(?:\/file)?$/.test(path)?310000:65000;const timer=setTimeout(()=>controller.abort(),waitLimit);try{const response=await fetch(path,{...options,signal:controller.signal,cache:'no-store'});let data;try{data=await response.json();}catch(error){if(error.name==='AbortError'||controller.signal.aborted)throw error;throw new Error('服務回覆無效，請確認服務狀態。');}if(!response.ok&&!data.analysis_id)throw new Error(reasons[data.error_code]||'請求未成功完成，請確認輸入、資料庫及服務狀態。');return data;}catch(error){if(error.name==='AbortError'||controller.signal.aborted)throw new Error('連線等待逾時，未取得結果；請先查看分析紀錄，避免重複提交。');throw error;}finally{clearTimeout(timer);}}
 function section(title){const block=element('section',undefined,'result-section');block.append(element('h4',title));$('result').append(block);return block;}
-function renderPreview(data){if(data.source_document)renderMail(data.source_document);if(!data.preliminary)return;const root=$('result');root.replaceChildren(element('div','正在檢查信件，完整結果稍後顯示。','simulation'));for(const item of data.findings||[]){root.append(element('div',(item.category==='prompt_injection'?'注入訊號：':'命中可疑釣魚特徵：')+item.summary,'finding'));}if(!data.findings?.length)root.append(element('p','文字檢查已完成，正在等待完整分析結果。','note'));}
+function renderPreview(data){if(data.source_document)renderMail(data.source_document);if(!data.preliminary)return;analysisPreviewReady=data.status!=='FAILED';updateBusyClock();const root=$('result');root.replaceChildren(element('div','完整分析等待中；初步文字檢查結果如下。','simulation'));for(const item of data.findings||[]){root.append(element('div',(item.category==='prompt_injection'?'注入訊號：':'命中可疑釣魚特徵：')+item.summary,'finding'));}if(!data.findings?.length)root.append(element('p',analysisPreviewReady?'文字檢查已完成，正在等待完整分析結果。':'初步解析未完成，正在等待完整分析回覆。','note'));}
 function renderSourceDocument(data){
   const block=section('信件內容｜人工判讀');
   const doc=data.source_document;
@@ -135,7 +189,7 @@ function renderSourceDocument(data){
   block.append(details);
   }
 }
-const categoryTitles={authentication:'寄件者是否可信',urgency_fear:'是否催促或威脅',generic_salutation:'如何稱呼收件人',url_structure:'連結導向何處',language:'用字與語氣',credential_request:'敏感資料要求',impersonation:'身分冒用跡象',url_deception:'網址偽裝跡象',analysis_override:'干預分析的文字',account_access:'帳戶登入或驗證要求',secret_disclosure:'秘密資料要求',software_execution:'軟體執行或安裝要求',payment_request:'付款或轉帳要求',coercive_request:'期限與聲稱後果',linked_execution:'下載與執行的關係',program_signal:'獨立文字或網址模式',event_fact:'模型提取的表述'};
+const categoryTitles={authentication:'寄件者是否可信',urgency_fear:'是否催促或威脅',generic_salutation:'如何稱呼收件人',url_structure:'連結導向何處',language:'用字與語氣',credential_request:'敏感資料要求',impersonation:'身分冒用跡象',url_deception:'網址偽裝跡象',analysis_override:'干預分析的文字',risky_attachment:'高風險附件副檔名',account_access:'帳戶登入或驗證要求',secret_disclosure:'秘密資料要求',software_execution:'軟體執行或安裝要求',payment_request:'付款或轉帳要求',coercive_request:'期限與聲稱後果',linked_execution:'下載與執行的關係',program_signal:'獨立文字或網址模式',event_fact:'模型提取的表述'};
 const reviewGuidance={
   URL_BOUNDARY_AMBIGUOUS:['連結範圍需要確認','信中文字與網址連在一起，可能影響連結擷取。','請從原始信件確認完整網址，並向寄件單位核實。'],
   URL_PARSE_WARNING:['連結無法完整辨識','部分網址格式無法可靠讀取。','請對照原始信件中的連結，不要直接開啟。'],
@@ -156,7 +210,7 @@ function nextStep(text){
   return '建議向熟悉這項業務的聯絡人確認，使用既有的電話或通訊管道。';
 }
 function readerNotes(data){
-  const model=data.analysis_explanation?.available?data.analysis_explanation.model:null;
+  const model=data.analysis_explanation?.available&&!isOutputTruncated(data)?data.analysis_explanation.model:null;
   const notes=uniqueText([...(model?.uncertainties||[]),...(model?.scope_limitations||[]),...(model?.explanations||[]).filter(item=>item.assessment==='not_verified').map(item=>item.explanation)]).map(text=>({title:'仍待確認',detail:text,action:nextStep(text),refs:[]}));
   const seen=new Set();
   const reviews=[...(data.review_items||[]),...(data.analysis_explanation?.review_items||[])];
@@ -173,7 +227,7 @@ function readerNotes(data){
   return notes;
 }
 function appendEvidence(block,refs,data){
-  const sources=[...(data.analysis_explanation?.model?.evidence||[]),...(data.source_document?.evidence||[])];
+  const sources=[...(!isOutputTruncated(data)?data.analysis_explanation?.model?.evidence||[]:[]),...(data.source_document?.evidence||[])];
   for(const ref of refs||[]){
     const source=sources.find(item=>item.ref===ref);
     const node=disclosure('引用原文',element('pre',evidenceText(source?.text??'此筆紀錄未保存這段原文，請對照完整信件。'),'source-text'),element('small','原文位置 '+ref,'note'));
@@ -183,8 +237,8 @@ function appendEvidence(block,refs,data){
 function renderExplanation(data){
   const block=section('分析理由與證據');
   const report=data.analysis_explanation;
-  const model=report?.available?report.model:null;
-  if(!model){block.append(element('p',data.simulation?'這次為操作流程模擬。切換至 AI 分析後，可取得信件判斷理由。':'目前沒有可採用的完整 AI 判斷理由。請參考已發現的內容及下方確認事項。','note'));return;}
+  const model=report?.available&&!isOutputTruncated(data)?report.model:null;
+  if(!model){block.append(element('p',isOutputTruncated(data)?truncatedOutputCopy:data.simulation?'這次為操作流程模擬。切換至 AI 分析後，可取得信件判斷理由。':'目前沒有可採用的完整 AI 判斷理由。請參考已發現的內容及下方確認事項。','note'));return;}
   block.append(element('p',model.source_note||'此筆舊紀錄未記錄理由來源，請對照原文。','note'));
   if(report.presentation?.status==='degraded')block.append(element('p','核心判斷已完成；詳細說明暫時無法整理，請對照所附原文。','note'));
   if(data.coverage?.status==='incomplete')block.append(element('p','本次僅涵蓋部分可分析內容，不能用來認定整封信件安全。請對照完整原文。','note'));
@@ -235,7 +289,7 @@ function renderFullResult(data){
   completion.append(element('p',data.status==='FAILED'?'分析未完成，已取得的內容保留供判讀。':classification==='UNKNOWN'?'分析流程已完成，但現有證據不足以判定風險。':'分析流程已完成。','note'));
   if(data.status==='FAILED'){
     completion.append(element('p','中止於'+({1:'信件讀取',2:'文字檢查',3:'AI 分析',4:'結果整理'}[data.failed_phase]||'分析流程'),'note'));
-    for(const error of data.errors||[])completion.append(element('p',reasons[error.code]||modelReasons[error.code]||'分析服務未能完成本次處理，請確認服務後重試。','error-message'));
+    for(const error of data.errors||[])completion.append(element('p',analysisErrorText(data,error.code,'分析服務未能完成本次處理，請確認服務後重試。'),'error-message'));
   }
 }
 function disclosure(title,...children){const node=element('details',undefined,'disclosure');node.append(element('summary',title),...children);return node;}
@@ -278,9 +332,9 @@ function renderResult(data){
   const semantic=data.analysis_reliability?.semantic_extraction;
   if(semantic?.availability==='recorded'&&semantic.semantic_completeness!=='complete')status.append(element('span','行為提取仍需核對','badge'));
   root.append(status);
-  const model=data.analysis_explanation?.available?data.analysis_explanation.model:null;
+  const model=data.analysis_explanation?.available&&!isOutputTruncated(data)?data.analysis_explanation.model:null;
   const summary=section('判斷摘要');
-  summary.append(element('p',model?.rationale||(data.status==='FAILED'?(data.rule_findings?.length?'已發現值得留意的信件內容，完整 AI 判斷尚未完成。請先對照證據，再向寄件單位確認。':'目前沒有可採用的完整 AI 判斷。請對照原文並確認信件來源，或稍後重新分析。'):data.simulation?'這筆歷史紀錄來自測試模擬，不能作為真實風險判斷。':'目前資訊不足，請依原文與證據交由人員判斷。'),'rationale'));
+  summary.append(element('p',isOutputTruncated(data)?truncatedOutputCopy:model?.rationale||(data.status==='FAILED'?(data.rule_findings?.length?'已發現值得留意的信件內容，完整 AI 判斷尚未完成。請先對照證據，再向寄件單位確認。':'目前沒有可採用的完整 AI 判斷。請對照原文並確認信件來源，或稍後重新分析。'):data.simulation?'這筆歷史紀錄來自測試模擬，不能作為真實風險判斷。':'目前資訊不足，請依原文與證據交由人員判斷。'),'rationale'));
   const observations=(model?.explanations||[]).filter(item=>item.assessment==='observed');
   const entries=observations.length?observations:(model?.features?.length?model.features:(data.rule_findings||[]));
   const signals=entries.length?section('重點觀察'):null;
@@ -292,7 +346,7 @@ function renderResult(data){
   }
   const notes=readerNotes(data);
   if(notes.length){const block=section('建議確認事項');for(const note of notes.slice(0,2)){block.append(element('p',note.detail,'note'),element('p',note.action,'next-action'));}if(notes.length>2)block.append(element('p','另有 '+(notes.length-2)+' 項確認事項，請查看詳細結果。','note'));}
-  if(data.status==='FAILED'){const block=section('分析未完成');for(const error of data.errors||[])block.append(element('p',reasons[error.code]||modelReasons[error.code]||'服務未能完成分析，請確認連線後重試。','error-message'));}
+  if(data.status==='FAILED'){const block=section('分析未完成');for(const error of data.errors||[])block.append(element('p',analysisErrorText(data,error.code,'服務未能完成分析，請確認連線後重試。'),'error-message'));}
   renderReportDetails(details);
   currentReport=data;updateExportControls();
   const more=element('button','查看詳細結果 →','secondary');
@@ -354,7 +408,7 @@ async function analyzeBatch(mode){
         const result=await request('/api/v1/analyses/file',{method:'POST',body:form});
         if(!result.analysis_id)throw new Error('未取得有效結果，請先檢查歷史紀錄。');
         item.result=result;item.state=result.status==='FAILED'?'failed':'completed';
-        item.error=result.persistence?.state==='unconfirmed'?'尚未確認保存，請先查看分析紀錄。':result.persistence?.state==='not_saved'?'本次結果未保存，請保留原始檔。':result.status==='FAILED'?(reasons[result.errors?.[0]?.code]||'分析未完成，請查看結果。'):'';
+        item.error=result.persistence?.state==='unconfirmed'?'尚未確認保存，請先查看分析紀錄。':result.persistence?.state==='not_saved'?'本次結果未保存，請保留原始檔。':result.status==='FAILED'?analysisErrorText(result,result.errors?.[0]?.code,'分析未完成，請查看結果。'):'';
         if(batchSelected===index){previewSequence++;renderResult(result);}
       }catch(error){
         item.state='failed';item.error=error.message+' 請先查看歷史，避免重複提交。';
@@ -374,7 +428,7 @@ async function analyzeBatch(mode){
 function clearInputSources(){
   $('email-file').value='';$('email-text').value='';$('clear-file').hidden=true;
   batchItems=[];batchSelected=0;batchStop=false;batchInvalid='';renderBatch();
-  previewSequence++;clearTimeout(previewTimer);
+  previewSequence++;previewCache=null;clearTimeout(previewTimer);
 }
 $('new-analysis').addEventListener('click',()=>{
   if(busy)return;
@@ -386,7 +440,7 @@ $('new-analysis').addEventListener('click',()=>{
   setBusy(false,'請選擇檔案或貼上新的郵件內容。');$(inputMode==='file'?'email-file':'email-text').focus();
 });
 $('batch-stop').addEventListener('click',()=>{batchStop=true;renderBatch();$('form-status').textContent='已要求停止；目前這封會完成，其餘不再送出。';});
-let previewSequence=0,previewTimer;
+let previewSequence=0,previewTimer,previewCache=null;
 async function refreshInputPreview(){
   if(sourceMode==='history')return;
   const sequence=++previewSequence;
@@ -404,6 +458,7 @@ async function refreshInputPreview(){
     else{options={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})};path='/api/v1/rules';}
     const data=await request(path,options);
     if(sequence!==previewSequence)return;
+    previewCache={file,text,mode:inputMode,data};
     if(data.source_document)renderMail(data.source_document);
     else if(file)$('mail-preview').replaceChildren(element('p','未取得預覽內容，請重新選檔或重試。','note'));
     if(data.status==='FAILED')$('preview-status').textContent='解析未成功，仍可查看已收到的原始文字。';
@@ -413,14 +468,41 @@ function inputChanged(){
   if(busy||sourceMode==='history')return;
   showReadingTab('mail');
   clearResultDetails();
-  previewSequence++;clearTimeout(previewTimer);
+  previewSequence++;previewCache=null;clearTimeout(previewTimer);
   $('result').replaceChildren(element('p','內容已更新，請開始分析以取得這封信的結果。','empty-state'));
   $('form-status').textContent='';
   if(inputMode==='text'&&$('email-text').value.trim())renderMail({source:'pasted_text',raw_text:$('email-text').value,parsed:null});
   previewTimer=setTimeout(refreshInputPreview,450);
 }
 $('email-text').addEventListener('input',()=>{if(inputMode==='text')inputChanged();});
-$('analysis-form').addEventListener('submit',async event=>{event.preventDefault();if(busy)return;if(sourceMode==='history'){$('form-status').textContent='目前正在檢視歷史紀錄，請先開始新的分析。';return;}previewSequence++;clearTimeout(previewTimer);if(inputMode==='file'&&batchItems.length>1){await analyzeBatch('configured');return;}const file=inputMode==='file'?$('email-file').files[0]:null;const text=inputMode==='text'?$('email-text').value:'';if(!file&&!text.trim()){$('form-status').textContent='請選擇檔案或貼上郵件內容。';return;}if(file&&file.size>2000000){$('form-status').textContent='檔案超過 2 MB，請使用單封較小的郵件。';return;}const mode='configured';showReadingTab('mail');setBusy(true,'正在分析，請稍候…');$('result').replaceChildren(loadingState('正在執行分析；尚無安全結論。'));try{let data;if(file){const form=new FormData();form.append('file',file);form.append('mode',mode);try{renderPreview(await request('/api/v1/rules/file',{method:'POST',body:form}));}catch{}data=await request('/api/v1/analyses/file',{method:'POST',body:form});}else{try{renderPreview(await request('/api/v1/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,mode})}));}catch{}data=await request('/api/v1/analyses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,mode})});}renderResult(data);$('form-status').textContent=data.persistence?.state==='unconfirmed'?'尚未確認保存結果；請先查看分析紀錄，避免重複提交。':data.persistence?.state==='not_saved'?'本次結果未保存；請保留原始信件，確認原因後再提交。':data.status==='FAILED'?'分析未完成；結果已保存，可由分析紀錄確認原因。':'結果已保存，請留意模擬標記與人員判斷參考事項。';}catch(error){$('result').replaceChildren(element('div','未取得可用分析結果。'+error.message,'error-message'));$('form-status').className='form-status error';$('form-status').textContent=error.message;}finally{setBusy(false,$('form-status').textContent);}});
+$('analysis-form').addEventListener('submit',async event=>{
+  event.preventDefault();if(busy)return;
+  if(sourceMode==='history'){$('form-status').textContent='目前正在檢視歷史紀錄，請先開始新的分析。';return;}
+  previewSequence++;clearTimeout(previewTimer);
+  if(inputMode==='file'&&batchItems.length>1){await analyzeBatch('configured');return;}
+  const file=inputMode==='file'?$('email-file').files[0]:null;
+  const text=inputMode==='text'?$('email-text').value:'';
+  if(!file&&!text.trim()){$('form-status').textContent='請選擇檔案或貼上郵件內容。';return;}
+  if(file&&file.size>2000000){$('form-status').textContent='檔案超過 2 MB，請使用單封較小的郵件。';return;}
+  const mode='configured';showReadingTab('mail');setBusy(true,'完整分析等待中…');
+  $('result').replaceChildren(loadingState('正在等候完整分析結果；尚無安全結論。'));
+  try{
+    // Preview is optional: reuse only an exact source match and never hold analysis behind it.
+    if(previewCache?.mode===inputMode&&previewCache.file===file&&previewCache.text===text)renderPreview(previewCache.data);
+    else if(file){
+      $('mail-preview').replaceChildren(element('p','已送出完整分析，信件預覽會隨結果更新。','note'));
+      $('preview-status').textContent='正在等候完整信件解析與分析結果。';
+    }else renderMail({source:'pasted_text',raw_text:text,parsed:null});
+    let data;
+    if(file){const form=new FormData();form.append('file',file);form.append('mode',mode);data=await request('/api/v1/analyses/file',{method:'POST',body:form});}
+    else data=await request('/api/v1/analyses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,mode})});
+    renderResult(data);
+    $('form-status').textContent=data.persistence?.state==='unconfirmed'?'尚未確認保存結果；請先查看分析紀錄，避免重複提交。':data.persistence?.state==='not_saved'?'本次結果未保存；請保留原始信件，確認原因後再提交。':data.status==='FAILED'?'分析未完成；結果已保存，可由分析紀錄確認原因。':'結果已保存，請留意模擬標記與人員判斷參考事項。';
+  }catch(error){
+    $('result').replaceChildren(element('div','未取得可用分析結果。'+error.message,'error-message'));
+    $('form-status').className='form-status error';$('form-status').textContent=error.message;
+  }finally{setBusy(false,$('form-status').textContent);}
+});
 $('email-file').addEventListener('change',()=>{prepareBatch();const selected=$('email-file').files.length>0;setBusy(false);$('clear-file').hidden=!selected;inputChanged();clearTimeout(previewTimer);refreshInputPreview();});
 $('clear-file').addEventListener('click',()=>{$('email-file').value='';batchItems=[];batchInvalid='';renderBatch();$('clear-file').hidden=true;$('email-file').focus();inputChanged();});
 let modelCheckRunning=false;

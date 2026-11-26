@@ -245,6 +245,63 @@ class OutputDiagnostic(Contract):
         return self
 
 
+TimeoutKind = Literal[
+    "connect",
+    "pool",
+    "read",
+    "write",
+    "unspecified",
+    "call_deadline",
+    "endpoint_deadline",
+    "total_deadline",
+]
+
+
+TransportCategory = Literal[
+    "bad_request",
+    "authentication",
+    "permission",
+    "not_found",
+    "unprocessable_request",
+    "rate_limit",
+    "server_error",
+    "http_status",
+    "connection_error",
+    "dns_error",
+    "tls_error",
+    "protocol_error",
+    "timeout",
+    "provider_error",
+    "unknown",
+]
+TransportParameter = Literal[
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "response_format",
+    "json_schema",
+    "model",
+    "messages",
+    "reasoning_effort",
+    "temperature",
+    "seed",
+    "stream",
+    "tools",
+    "tool_choice",
+    "context_window",
+    "num_ctx",
+]
+
+
+class TransportDiagnostic(Contract):
+    """Typed metadata only: no exception message, response body, request or headers."""
+
+    category: TransportCategory
+    http_status: int | None = Field(default=None, ge=100, le=599, strict=True)
+    parameter: TransportParameter | None = None
+    timeout_phase: TimeoutKind | None = None
+
+
 class CallMetadata(Contract):
     stage: Literal["a", "b"]
     attempt: int = Field(ge=1, le=30)
@@ -257,6 +314,12 @@ class CallMetadata(Contract):
     error_code: str | None = None
     diagnostic: OutputDiagnostic | None = None
     request_budget: RequestBudget | None = None
+    timeout_kind: TimeoutKind | None = None
+    transport_diagnostic: TransportDiagnostic | None = None
+    output_token_parameter: Literal["max_completion_tokens", "max_tokens"] | None = None
+    request_schema_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    request_data_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    request_prompt_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class RecoveryEvent(Contract):

@@ -119,13 +119,13 @@ Ollama 與外部服務使用**同一份根目錄 `.env`**。服務須提供 Open
 確認 Ollama 已啟動，使用 `ollama list` 查看完整模型 ID；需要時在另一個終端機執行 `ollama serve`。以下以 `gemma4:e4b` 為例，請按實際已安裝模型修改：
 
 ```dotenv
-PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false}]'
-PHISHSHIELD_LLM_ENDPOINTS_B='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false}]'
+PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false,"output_token_parameter":"max_tokens"}]'
+PHISHSHIELD_LLM_ENDPOINTS_B='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false,"output_token_parameter":"max_tokens"}]'
 PHISHSHIELD_LLM_TEMPERATURE=0
 PHISHSHIELD_LLM_SEED=42
 ```
 
-每個端點陣列必須在 `.env` 中寫成**單行 JSON**。A／B 可以使用同一模型，也可各自指定模型與服務。模型 ID 精確比對，不自動補上 `:latest`。
+每個端點陣列必須在 `.env` 中寫成**單行 JSON**。A／B 可以使用同一模型，也可各自指定模型與服務。模型 ID 精確比對，不自動補上 `:latest`。`output_token_parameter`指定服務接受的輸出上限欄位：Ollama 0.40.x使用`max_tokens`，預設則為`max_completion_tokens`；這不改變輸出上限數值，請依端點規格設定。
 
 ### 外部 API 與備援
 
@@ -139,12 +139,12 @@ PHISHSHIELD_LLM_ENDPOINTS_B='[{"endpoint":"https://api.example.com/v1","model":"
 A／B 各可配置 **1–10 組**端點，按陣列順序備援。例如 A 先使用本機，服務暫時中斷時再嘗試外部服務：
 
 ```dotenv
-PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false},{"endpoint":"https://backup.example.com/v1","model":"remote-model-id","api_key":"YOUR_API_KEY","thinking":null}]'
+PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false,"output_token_parameter":"max_tokens"},{"endpoint":"https://backup.example.com/v1","model":"remote-model-id","api_key":"YOUR_API_KEY","thinking":null}]'
 ```
 
 端點支援自訂路徑。原生啟動允許 HTTPS，或 localhost／127.0.0.1／::1 的本機 HTTP；Compose 另明確允許容器使用 `host.docker.internal` 連到宿主機。其他區網明文 HTTP、內嵌帳密、query 與 fragment 不接受。`api_key` 留空時不會暗中取用 `OPENAI_API_KEY`；需要認證的服務應在相應端點填妥金鑰。
 
-暫時斷線、逾時及可恢復的服務錯誤會有限重試，再按順序嘗試同階段的備援。預設每端點最多三次嘗試，包含首次，全部受總期限限制。認證／權限、輸出格式或證據支持驗證失敗會保留未完成結果，不透過反覆換模型抽取答案。只有一組端點而連線失敗時，畫面會提示離線或未完成原因。
+暫時斷線、建立連線逾時、連線容量不足及可恢復服務錯誤會有限重試，再按順序嘗試同階段的備援。預設每端點最多三次嘗試，包含首次，全部受總期限限制。讀取／寫入逾時、生成期限到達或來源不明的timeout會保留未完成結果，不再重做同一判斷或換模型重抽。認證／權限、輸出格式及證據支持驗證失敗亦停止。只有一組端點而連線失敗時，畫面會提示離線或未完成原因。
 
 **選用遠端或遠端備援，即表示相應階段的資料可能送到該服務。** A 會收到郵件分析材料與原文證據；B 收到受控結構資料。若 A／B 使用同一供應商，B 的資料隔離不代表該供應商未取得 A 的原文。請妥善保管後端 `.env` 與金鑰。
 
@@ -165,7 +165,10 @@ PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"g
 | `PHISHSHIELD_LLM_CALL_TIMEOUT_SECONDS` | 單次模型呼叫 10 秒 |
 | `PHISHSHIELD_LLM_TOTAL_TIMEOUT_SECONDS` | A／B 模型流程合計 30 秒 |
 | `PHISHSHIELD_ANALYSIS_TIMEOUT_SECONDS` | 整體解析、模型、報告資料整理與保存 45 秒 |
-| `PHISHSHIELD_LLM_MAX_OUTPUT_TOKENS` | 每次 2,048 tokens |
+| `PHISHSHIELD_LLM_MAX_OUTPUT_TOKENS_A` | A 每次最多 2,048 tokens |
+| `PHISHSHIELD_LLM_MAX_OUTPUT_TOKENS_B` | B 每次最多 2,048 tokens |
+
+A／B 上限各自設定，範圍為 1–16,384 tokens，所有同階段備援沿用該階段額度。未指定的階段回退至相容設定 `PHISHSHIELD_LLM_MAX_OUTPUT_TOKENS`（程式預設 2,048），兩種設定不是相加。範本直接列出 A／B，無須再填共用額度。輸出額度也納入該次 context 預留；放大 B 不會改變 A、輸入上限或分析總期限。
 
 慢速本機模型可能需要調整期限與輸出上限。單封耗時受信件長度、模型速度及重試影響；提高上限不代表一定完成。其他重試與資源限制見 [.env.example](.env.example)。服務無法完成時會明示原因，不自動改用模擬結果。
 
@@ -185,6 +188,7 @@ PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"g
 - **未啟用模型分析**：本次未進入模型階段，例如輸入未通過解析；不等於信件安全。
 
 規則訊號是判讀參考，命中不直接等同釣魚。中文摘要、理由與建議由程式依已驗證的模型觀察及原文證據整理，畫面會標示說明來源；不代表已完成外部查證。「交由人員判斷」也不表示系統已有人工審批流程。
+
 
 分析與保存狀態亦分開：有分析 ID 不代表已成功保存。若畫面提示未保存、保存未確認，或提交後連線中斷，請先查閱分析紀錄，再決定是否重送；重送會建立新分析。重新開啟歷史只讀取保存內容，不重新呼叫模型。
 

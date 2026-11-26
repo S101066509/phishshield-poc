@@ -25,7 +25,16 @@ from app.domain.email_models import AttachmentMetadata, NormalizedEmail
 from app.domain.enums import EmailSource
 from app.domain.reliability_models import HeaderProfile
 
-HEADERS = {"from", "reply-to", "to", "cc", "subject", "authentication-results", "dkim-signature"}
+HEADERS = {
+    "from",
+    "reply-to",
+    "to",
+    "cc",
+    "subject",
+    "authentication-results",
+    "received-spf",
+    "dkim-signature",
+}
 
 
 def _check_structure(message: Message, limits: ParseLimits) -> HeaderProfile:
@@ -243,7 +252,10 @@ def _parse(raw: bytes, source: EmailSource, limits: ParseLimits) -> NormalizedEm
         warnings.append("EMPTY_BODY")
     if email.hidden_texts:
         warnings.append("HIDDEN_CONTENT_PRESENT")
-    if "authentication-results" in email.headers or "dkim-signature" in email.headers:
+    if any(
+        name in email.headers
+        for name in ("authentication-results", "received-spf", "dkim-signature")
+    ):
         warnings.append("UNTRUSTED_AUTH_HEADERS")
     if any(url.parse_warning for url in email.urls):
         warnings.append("URL_PARSE_WARNING")

@@ -60,6 +60,15 @@ ATTACHMENT_SUFFIXES = frozenset(
         ".docm",
         ".xlsm",
         ".pptm",
+        # 網頁偷渡與壓縮封存副檔名（僅檢視檔名中繼資料，不開啟或解析附件內容）。
+        ".html",
+        ".htm",
+        ".shtml",
+        ".svg",
+        ".mhtml",
+        ".zip",
+        ".rar",
+        ".7z",
     }
 )
 

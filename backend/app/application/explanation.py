@@ -2,6 +2,8 @@
 
 import re
 
+from app.analysis.llm.handoff import validate_judgment
+from app.application.abstention import build_abstention_summary
 from app.application.deterministic_report import (
     CoreEvidenceUnavailable,
     base_model,
@@ -90,6 +92,12 @@ def explain(email, models, result) -> dict:
                 for reference in binding.evidence_refs:
                     registry.resolve(models.event_evidence_map[reference])
         if models.judgment_format == "core_slots_1":
+            validate_judgment(
+                models.structured_judgment,
+                models.handoff,
+                models.handoff_evidence_map,
+                simulation=False,
+            )
             by_id = {item.id for item in models.handoff.observations}
             for unit in models.structured_judgment.reason_supports or []:
                 if unit.observation_id is not None and unit.observation_id not in by_id:
@@ -131,6 +139,12 @@ def explain(email, models, result) -> dict:
             output["model"] = build_deterministic_model(
                 models, evidence, OBSERVATION_LABELS, UNCERTAINTY_LABELS
             )
+            abstention = build_abstention_summary(models, OBSERVATION_LABELS)
+            if abstention is not None:
+                output["model"]["abstention"] = abstention
+                output["model"]["rationale"] = (
+                    abstention["summary"] + " " + " ".join(abstention["next_steps"])
+                )
             state = PresentationState(
                 source="deterministic_observations",
                 status="complete",

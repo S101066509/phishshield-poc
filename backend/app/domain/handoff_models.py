@@ -4,7 +4,10 @@ from typing import Annotated, Literal
 from pydantic import ConfigDict, Field, model_validator
 
 from app.domain.email_models import Contract
-from app.domain.explanation_policy import ExplanationAssessment, validate_explanation_reference
+from app.domain.explanation_policy import (
+    ExplanationAssessment,
+    validate_explanation_reference,
+)
 from app.domain.reliability_models import InputCoverage
 
 KINDS = (
@@ -37,6 +40,7 @@ Reason = Literal[
     "LANGUAGE_ANOMALY",
     "ANALYSIS_OVERRIDE",
     "AUTHENTICATION_UNVERIFIED",
+    "RISKY_ATTACHMENT",
     "NO_RISK_OBSERVED",
     "EVIDENCE_INSUFFICIENT",
     "SIMULATED_ANALYSIS",
@@ -75,6 +79,7 @@ class JudgeInput(Contract):
     url_userinfo_present: bool
     url_ip_host_present: bool
     risky_attachment_extension: bool
+    risky_attachment_evidence_ids: tuple[EvidenceID, ...] = Field(default=(), max_length=100)
     credential_rule_observed: bool
     urgency_rule_observed: bool
     injection_rule_observed: bool
@@ -92,6 +97,10 @@ class JudgeInput(Contract):
                 raise ValueError("INVALID_OBSERVATION_SLOT")
             if any(not ref.startswith(f"e_{self.scope_id}_") for ref in item.evidence_ids):
                 raise ValueError("INVALID_EVIDENCE_SCOPE")
+        if any(
+            not ref.startswith(f"e_{self.scope_id}_") for ref in self.risky_attachment_evidence_ids
+        ):
+            raise ValueError("INVALID_EVIDENCE_SCOPE")
         return self
 
 
@@ -168,6 +177,7 @@ class ReasonSlots(Contract):
     LANGUAGE_ANOMALY: SupportBinding | None
     ANALYSIS_OVERRIDE: SupportBinding | None
     AUTHENTICATION_UNVERIFIED: SupportBinding | None
+    RISKY_ATTACHMENT: SupportBinding | None = None
     NO_RISK_OBSERVED: SupportBinding | None
     EVIDENCE_INSUFFICIENT: SupportBinding | None
     SIMULATED_ANALYSIS: SupportBinding | None

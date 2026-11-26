@@ -2,6 +2,8 @@
 
 """Read the shared root .env plus explicit environment overrides; never call services."""
 
+from typing import Literal
+
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -15,6 +17,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.config import ENV_FILE
 
+OutputTokenParameter = Literal["max_completion_tokens", "max_tokens"]
+
 
 class EndpointSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -23,6 +27,7 @@ class EndpointSettings(BaseModel):
     api_key: SecretStr = Field(default=SecretStr(""), repr=False)
     provider: str = Field(default="", max_length=80, pattern=r"^[^\x00-\x1f\x7f-\x9f]*$")
     thinking: bool | None = Field(default=None, strict=True)
+    output_token_parameter: OutputTokenParameter = "max_completion_tokens"
 
 
 class LLMSettings(BaseSettings):
@@ -39,6 +44,8 @@ class LLMSettings(BaseSettings):
     model_a: str = Field(default="", max_length=200)
     model_b: str = Field(default="", max_length=200)
     thinking: bool | None = None
+    # 明確指定相容端點實際接受的Chat Completions欄位，不由模型或服務商名稱猜測。
+    output_token_parameter: OutputTokenParameter = "max_completion_tokens"
     # 容器顯式啟用後，僅額外允許主機Docker橋接名稱使用HTTP。
     allow_docker_host_http: bool = False
     temperature: float = Field(default=0.0, ge=0, le=2, allow_inf_nan=False)
@@ -58,7 +65,10 @@ class LLMSettings(BaseSettings):
     retry_max_delay_seconds: float = Field(default=4, ge=0, le=30, allow_inf_nan=False)
     retry_jitter_ratio: float = Field(default=0.2, ge=0, le=1, allow_inf_nan=False)
     connection_reset_timeout_seconds: float = Field(default=2, gt=0, le=10, allow_inf_nan=False)
+    # 舊設定保留為共同預設；單階段明訂額度時才覆蓋該階段，所有備援共用。
     max_output_tokens: int = Field(default=2048, ge=1, le=16384)
+    max_output_tokens_a: int | None = Field(default=None, ge=1, le=16384)
+    max_output_tokens_b: int | None = Field(default=None, ge=1, le=16384)
     max_input_bytes: int = Field(default=256000, ge=1, le=2000000)
     max_request_bytes: int = Field(default=256000, ge=1, le=2000000)
     # Only an explicitly known runner capacity, never a model's advertised maximum.
@@ -78,6 +88,19 @@ class LLMSettings(BaseSettings):
         if info.field_name == "seed" and isinstance(value, str) and value.strip().lower() == "null":
             return None
         return value
+
+    @field_validator("max_output_tokens_a", "max_output_tokens_b", mode="before")
+    @classmethod
+    def validate_stage_output_tokens(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("OUTPUT_TOKEN_LIMIT_MUST_BE_INTEGER")
+        return value
+
+    def output_tokens_for(self, stage: Literal["a", "b"]) -> int:
+        if stage not in {"a", "b"}:
+            raise ValueError("INVALID_MODEL_STAGE")
+        stage_limit = self.max_output_tokens_a if stage == "a" else self.max_output_tokens_b
+        return self.max_output_tokens if stage_limit is None else stage_limit
 
     @model_validator(mode="after")
     def validate_retry_delays(self):

@@ -130,19 +130,32 @@ class AnalysisService:
             "skipped_by_rules": False,
         }
         # Persist only closed diagnostic codes and fields; no raw provider reply or exception.
-        if isinstance(models, LLMFailure):
+        if isinstance(models, LLMFailure) or (
+            isinstance(models, LLMRun)
+            and any(call.transport_diagnostic is not None for call in models.calls)
+        ):
+            model_diagnostic = getattr(models, "diagnostic", None)
             payload["model_diagnostics"] = {
                 "analysis_method": getattr(models, "analysis_method", None),
                 "judgment_format": getattr(models, "judgment_format", None),
-                "failed_stage": models.failed_stage,
-                "diagnostic": models.diagnostic.model_dump(mode="json")
-                if models.diagnostic
+                "failed_stage": getattr(models, "failed_stage", None),
+                "diagnostic": model_diagnostic.model_dump(mode="json")
+                if model_diagnostic
                 else None,
                 "calls": [
                     {
                         "stage": call.stage,
                         "attempt": call.attempt,
                         "error_code": call.error_code,
+                        "latency_ms": call.latency_ms,
+                        "timeout_kind": call.timeout_kind,
+                        "transport_diagnostic": call.transport_diagnostic.model_dump(mode="json")
+                        if call.transport_diagnostic
+                        else None,
+                        "output_token_parameter": call.output_token_parameter,
+                        "request_schema_sha256": call.request_schema_sha256,
+                        "request_data_sha256": call.request_data_sha256,
+                        "request_prompt_sha256": call.request_prompt_sha256,
                         "request_budget": call.request_budget.model_dump(mode="json")
                         if call.request_budget
                         else None,

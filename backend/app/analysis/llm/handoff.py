@@ -6,7 +6,11 @@ from pydantic import Field, model_validator
 
 from app.analysis.llm.compact_input import coverage_for_mail
 from app.analysis.llm.evidence_catalog import evidence_catalog
-from app.analysis.llm.reason_support import SUPPORT, validate_bound_support, validate_flat_support
+from app.analysis.llm.reason_support import (
+    SUPPORT,
+    validate_bound_support,
+    validate_flat_support,
+)
 from app.analysis.rules import RuleEngine
 from app.domain.email_models import Contract
 from app.domain.handoff_models import (
@@ -19,6 +23,9 @@ from app.domain.handoff_models import (
 )
 from app.domain.handoff_models import StructuredJudgment as Judgment
 from app.domain.llm_models import FeatureOutput, JudgmentOutput, RiskExplanation
+
+AUTHENTICATION_HEADERS = ("authentication-results", "received-spf", "dkim-signature")
+AUTHENTICATION_REFERENCE_PREFIXES = tuple(f"header:{name}:" for name in AUTHENTICATION_HEADERS)
 
 
 class SlotObservation(Contract):
@@ -72,6 +79,18 @@ def validate_native_extraction(value, *, has_urls, has_authentication):
             raise ValueError("INVALID_APPLICABILITY")
         if len(item.evidence_refs) > 4:
             raise ValueError("INVALID_OBSERVATION_REFERENCE")
+        # 僅風險正向／歧義觀察須含對應種類；陰性查閱與額外正文引用保持原義。
+        # 現有生成Schema子集不能在混合陣列表示contains，因此這是獨立runtime必要條件。
+        if item.assessment in {"observed", "uncertain"}:
+            prefixes = (
+                ("url:",)
+                if item.kind == "url_deception"
+                else AUTHENTICATION_REFERENCE_PREFIXES
+                if item.kind == "authentication"
+                else ()
+            )
+            if prefixes and not any(ref.startswith(prefixes) for ref in item.evidence_refs):
+                raise ValueError("INVALID_OBSERVATION_REFERENCE")
 
 
 def _ip(host):
@@ -82,12 +101,29 @@ def _ip(host):
         return False
 
 
-def project(mail, rules, extraction, *, scope_id=None, coverage=None):
+def project(mail, rules, extraction, *, scope_id=None, coverage=None, native=False):
     extraction = Extraction.model_validate_json(
         extraction.model_dump_json(exclude_computed_fields=True), strict=True
     )
+    if native:
+        validate_native_extraction(
+            extraction,
+            has_urls=bool(mail.urls),
+            has_authentication=any(mail.headers.get(name) for name in AUTHENTICATION_HEADERS),
+        )
     catalog = evidence_catalog(mail)
-    references = sorted({ref for item in extraction.observations for ref in item.evidence_refs})
+    attachment_refs = sorted(
+        {
+            ref
+            for finding in rules.findings
+            if finding.rule_id == "EMAIL_ATTACHMENT_EXTENSION"
+            for ref in finding.evidence_refs
+        }
+    )
+    references = sorted(
+        {ref for item in extraction.observations for ref in item.evidence_refs}
+        | set(attachment_refs)
+    )
     if not set(references) <= set(catalog) or len(references) > 999:
         raise ValueError("INVALID_OBSERVATION_REFERENCE")
     # Recompute registered signals instead of trusting supplied summaries/flags.
@@ -95,6 +131,7 @@ def project(mail, rules, extraction, *, scope_id=None, coverage=None):
         raise ValueError("INVALID_RULE_CONTEXT")
     scope_id = scope_id or uuid4().hex[:16]
     forward = {ref: f"e_{scope_id}_{index:03d}" for index, ref in enumerate(references, 1)}
+    risky_attachment_ids = tuple(sorted({forward[ref] for ref in attachment_refs}))
     observations = []
     by_kind = {item.kind: item for item in extraction.observations}
     for index, kind in enumerate(KINDS, 1):
@@ -102,10 +139,7 @@ def project(mail, rules, extraction, *, scope_id=None, coverage=None):
         if item.assessment == "not_applicable":
             if (kind == "url_deception" and mail.urls) or (
                 kind == "authentication"
-                and any(
-                    mail.headers.get(name)
-                    for name in ("authentication-results", "received-spf", "dkim-signature")
-                )
+                and any(mail.headers.get(name) for name in AUTHENTICATION_HEADERS)
             ):
                 raise ValueError("INVALID_APPLICABILITY")
         observations.append(
@@ -129,6 +163,7 @@ def project(mail, rules, extraction, *, scope_id=None, coverage=None):
         ),
         url_ip_host_present=any(_ip(url.hostname) for url in mail.urls),
         risky_attachment_extension="EMAIL_ATTACHMENT_EXTENSION" in identifiers,
+        risky_attachment_evidence_ids=risky_attachment_ids,
         credential_rule_observed="EMAIL_CREDENTIAL_REQUEST" in identifiers,
         urgency_rule_observed="EMAIL_URGENCY" in identifiers,
         injection_rule_observed=any(key.startswith("INJECTION_") for key in identifiers),
@@ -174,13 +209,20 @@ def validate_judgment(value, packet, mapping, *, simulation=False):
         raise ValueError("INVALID_OBSERVATION")
     selected = [observations[key] for key in value.supporting_observation_ids]
     allowed = {ref for item in selected for ref in item.evidence_ids}
+    attachment_allowed = (
+        set(packet.risky_attachment_evidence_ids) if packet.risky_attachment_extension else set()
+    )
     refs = value.evidence_refs + [ref for item in value.explanations for ref in item.evidence_refs]
     if not set(refs) <= set(mapping):
         raise ValueError("INVALID_EVIDENCE")
     validate_flat_support(value, packet)
-    if value.classification != "UNKNOWN" and (
-        not selected or not set(value.evidence_refs) & allowed
-    ):
+    has_model_support = bool(selected and (set(value.evidence_refs) & allowed))
+    has_attachment_support = bool(
+        "RISKY_ATTACHMENT" in value.reason_codes
+        and attachment_allowed
+        and (set(value.evidence_refs) & attachment_allowed)
+    )
+    if value.classification != "UNKNOWN" and not (has_model_support or has_attachment_support):
         raise ValueError("INSUFFICIENT_SUPPORT")
     if "NO_RISK_OBSERVED" in value.reason_codes and any(
         item.assessment in {"observed", "uncertain"} for item in packet.observations
@@ -188,9 +230,23 @@ def validate_judgment(value, packet, mapping, *, simulation=False):
         raise ValueError("CONTRADICTORY_REASON")
     if value.classification == "SAFE" and value.reason_codes != ["NO_RISK_OBSERVED"]:
         raise ValueError("UNSUPPORTED_SAFE")
-    if value.classification in {"PHISHING", "SUSPICIOUS"} and not any(
-        code in SUPPORT and code != "AUTHENTICATION_UNVERIFIED" for code in value.reason_codes
-    ):
+    url_obs = next((item for item in packet.observations if item.kind == "url_deception"), None)
+    weak_uncertain_url = (
+        url_obs is not None
+        and url_obs.assessment == "uncertain"
+        and not packet.url_userinfo_present
+        and not packet.url_ip_host_present
+    )
+    has_model_risk = any(
+        code in SUPPORT
+        and code != "AUTHENTICATION_UNVERIFIED"
+        and not (code == "URL_DECEPTION" and weak_uncertain_url)
+        for code in value.reason_codes
+    )
+    has_attachment_risk = "RISKY_ATTACHMENT" in value.reason_codes and bool(attachment_allowed)
+    if value.classification == "PHISHING" and not has_model_risk:
+        raise ValueError("UNSUPPORTED_RISK")
+    if value.classification == "SUSPICIOUS" and not (has_model_risk or has_attachment_risk):
         raise ValueError("UNSUPPORTED_RISK")
 
 
@@ -220,20 +276,13 @@ def validate_run(mail, rules, model):
         actual_coverage = coverage_for_mail(mail)
         if model.coverage.status == "complete" and model.coverage != actual_coverage:
             raise ValueError("MISMATCHED_COVERAGE")
-        validate_native_extraction(
-            model.features,
-            has_urls=bool(mail.urls),
-            has_authentication=any(
-                mail.headers.get(name)
-                for name in ("authentication-results", "received-spf", "dkim-signature")
-            ),
-        )
     packet, mapping = project(
         mail,
         rules,
         model.features,
         scope_id=model.handoff.scope_id,
         coverage=model.coverage if model.judgment_format == "core_slots_1" else None,
+        native=model.judgment_format == "core_slots_1",
     )
     if packet != model.handoff or mapping != model.handoff_evidence_map:
         raise ValueError("MISMATCHED_HANDOFF")

@@ -42,6 +42,7 @@ CATEGORIES = {
     "impersonation": "身分冒用跡象",
     "url_deception": "網址偽裝跡象",
     "analysis_override": "干預分析的文字",
+    "risky_attachment": "高風險附件副檔名",
     "account_access": "帳戶登入或驗證要求",
     "secret_disclosure": "秘密資料要求",
     "software_execution": "軟體執行或安裝要求",
@@ -101,6 +102,50 @@ ERROR_COPY = {
     "INPUT_TOO_LARGE": "信件超過大小限制，請使用 2 MB 以內的單封 EML 或 TXT。",
     "PARSE_FAILED": "信件未能完整讀取，請重新匯入完整 EML 或 UTF-8 TXT。",
 }
+TRUNCATED_OUTPUT_COPY = (
+    "模型輸出達長度上限，回覆未完成；這次未採用模型判斷，請先對照信件與既有證據。"
+)
+
+
+def _output_truncated(record):
+    """Use only matching closed failure diagnostics, never model prose or partial JSON."""
+    state = record.get("model_analysis") or {}
+    if (
+        record.get("status") != "FAILED"
+        or state.get("activated") is False
+        or state.get("completed") is True
+    ):
+        return False
+    errors = record.get("errors", [])
+    if not isinstance(errors, list):
+        return False
+    codes = (
+        [item.get("code") for item in errors if isinstance(item, dict)]
+        if errors
+        else state.get("reason_codes", [])
+    )
+    if not isinstance(codes, list) or "LLM_OUTPUT_INVALID" not in codes:
+        return False
+    envelope = record.get("model_diagnostics")
+    if not isinstance(envelope, dict):
+        return False
+    diagnostic = envelope.get("diagnostic")
+    calls = envelope.get("calls")
+    if diagnostic is None and isinstance(calls, list) and calls:
+        call = calls[-1]
+        if (
+            envelope.get("failed_stage") in ("a", "b")
+            and isinstance(call, dict)
+            and call.get("stage") == envelope["failed_stage"]
+            and call.get("error_code") == "LLM_OUTPUT_INVALID"
+        ):
+            diagnostic = call.get("diagnostic")
+    return (
+        isinstance(diagnostic, dict)
+        and diagnostic.get("reason") == "output_truncated"
+        and diagnostic.get("finish_reason") == "length"
+        and diagnostic.get("category") in (None, "output_truncated")
+    )
 
 
 def _unique(values):
@@ -110,9 +155,9 @@ def _unique(values):
 
 
 def _next_step(text):
-    if re.search(r"網址|連結|URL|網站", text, re.I):
+    if re.search(r"網址|連結|URL|網站", text, re.IGNORECASE):
         return "建議從已知的官方入口查證，先不要點擊信內連結。"
-    if re.search(r"寄件|身分|身份|SPF|DKIM|DMARC", text, re.I):
+    if re.search(r"寄件|身分|身份|SPF|DKIM|DMARC", text, re.IGNORECASE):
         return "建議透過既有聯絡方式確認寄件人，必要時請郵件管理人員協助。"
     return "建議向熟悉這項業務的聯絡人確認，使用既有聯絡電話或通訊管道。"
 
@@ -197,6 +242,8 @@ def _model_state(record):
         return "模型狀態未記錄"
     if completed:
         return "模型已完成"
+    if _output_truncated(record):
+        return "模型未完成 · 輸出達長度上限"
     return "模型未完成" if activated else "模型未啟用"
 
 
@@ -256,6 +303,9 @@ def _pdf(records):
         mail = document.get("parsed") or {}
         explanation = record.get("analysis_explanation") or {}
         model = (explanation.get("model") or {}) if explanation.get("available") else {}
+        truncated = _output_truncated(record)
+        if truncated:
+            model = {}
         classification = (
             "UNKNOWN" if record.get("status") == "FAILED" else record.get("final_classification")
         )
@@ -291,7 +341,9 @@ def _pdf(records):
         if model:
             paragraph(model.get("source_note") or "此筆舊紀錄未記錄理由來源，請對照原文。")
         paragraph(
-            model.get("rationale")
+            TRUNCATED_OUTPUT_COPY
+            if truncated
+            else model.get("rationale")
             or "目前沒有可採用的完整 AI 判斷理由。請對照信件內容及下方建議確認事項。"
         )
         evidence = {item["ref"]: item.get("text", "") for item in document.get("evidence", [])}
@@ -362,7 +414,11 @@ def _pdf(records):
             paragraph("分析未完成原因", "heading")
         for item in record.get("errors", []):
             paragraph(
-                ERROR_COPY.get(item.get("code"), "分析服務未能完成本次處理，請確認服務後重試。")
+                TRUNCATED_OUTPUT_COPY
+                if item.get("code") == "LLM_OUTPUT_INVALID" and truncated
+                else ERROR_COPY.get(
+                    item.get("code"), "分析服務未能完成本次處理，請確認服務後重試。"
+                )
             )
         paragraph("分析結果供人員對照原文與證據判讀，安全性仍須配合實際情境確認。")
 

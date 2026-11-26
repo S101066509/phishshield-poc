@@ -1,6 +1,7 @@
 # 檔案功能：協調雙模型分析、輸出與證據驗證，以及期限、重試和失敗回報。
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable
 from time import perf_counter
@@ -31,6 +32,7 @@ from app.domain.llm_models import (
     OutputDiagnostic,
     RecoveryEvent,
     TokenUsage,
+    TransportDiagnostic,
     provider_label,
 )
 from app.domain.stage_failure import StageFailure, stage_failure
@@ -48,9 +50,13 @@ from app.infrastructure.llm_provider.base import (
     ProviderResponse,
 )
 from app.infrastructure.llm_provider.errors import (
+    RecoveryPolicy,
     output_diagnostic,
     provider_usage,
     recovery_policy,
+)
+from app.infrastructure.llm_provider.errors import (
+    transport_diagnostic as provider_transport_diagnostic,
 )
 from app.infrastructure.llm_provider.fake import FakeProvider
 from app.infrastructure.llm_provider.openai import OpenAIProvider
@@ -297,6 +303,9 @@ class DualLLMPipeline:
 
     def _system_prompt(self, stage):
         return PROMPT_A if stage == "a" else PROMPT_B
+
+    def _request_system_prompt(self, stage, response_schema_json):
+        return self._system_prompt(stage)
 
     def _model_uncertainties(self, features, judgment):
         return [*features.uncertainties, *judgment.uncertainties]
@@ -604,9 +613,26 @@ class DualLLMPipeline:
                         model_id=model_id,
                         endpoint_index=index,
                         offset=offset,
+                        endpoint_deadline=endpoint_deadline,
                     )
             except TimeoutError:
                 if asyncio.get_running_loop().time() >= deadline:
+                    raise LLMError("LLM_TIMEOUT") from None
+                last_call = calls[-1] if calls else None
+                recovering = (
+                    last_call is not None
+                    and last_call.stage == stage
+                    and last_call.endpoint_index == index
+                    and events
+                    and events[-1].stage == stage
+                    and events[-1].after_attempt == last_call.attempt
+                )
+                can_failover = recovering and (
+                    last_call.timeout_kind in {"connect", "pool"}
+                    or last_call.error_code in {"LLM_CONNECTION_LOST", "LLM_PROVIDER_FAILED"}
+                )
+                if not can_failover:
+                    # 只允許已知傳輸恢復的配額切換；未知phase或生成取消不重新抽取判斷。
                     raise LLMError("LLM_TIMEOUT") from None
                 if index == len(candidates):
                     raise LLMError("LLM_ENDPOINTS_OFFLINE") from None
@@ -633,26 +659,26 @@ class DualLLMPipeline:
         model_id,
         endpoint_index,
         offset,
+        endpoint_deadline=None,
     ):
         settings = self.settings
         try:
             data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         except (ValueError, UnicodeError, RecursionError):
             raise LLMError("INVALID_LLM_INPUT") from None
+        response_schema_json = json.dumps(
+            self._request_schema(
+                stage,
+                payload,
+                allowed_refs if allowed_refs is not None else payload.get("evidence_catalog", {}),
+            )
+        )
         request = GenerationRequest(
-            system_prompt=self._system_prompt(stage),
+            system_prompt=self._request_system_prompt(stage, response_schema_json),
             data_json=data,
-            response_schema_json=json.dumps(
-                self._request_schema(
-                    stage,
-                    payload,
-                    allowed_refs
-                    if allowed_refs is not None
-                    else payload.get("evidence_catalog", {}),
-                )
-            ),
+            response_schema_json=response_schema_json,
             model_id=model_id,
-            max_output_tokens=settings.max_output_tokens,
+            max_output_tokens=settings.output_tokens_for(stage),
         )
         try:
             check_schema_subset(json.loads(request.response_schema_json))
@@ -661,7 +687,11 @@ class DualLLMPipeline:
                 "LLM_SCHEMA_UNSUPPORTED",
                 diagnostic=OutputDiagnostic(reason="schema_mismatch", category="core_schema"),
             ) from None
-        budget = request_budget(request, settings, payload)
+        provider_settings = getattr(provider, "settings", None)
+        budget_settings = (
+            provider_settings if isinstance(provider_settings, LLMSettings) else settings
+        )
+        budget = request_budget(request, budget_settings, payload)
         if over_budget(budget):
             raise LLMError(
                 "LLM_INPUT_TOO_LARGE",
@@ -693,11 +723,19 @@ class DualLLMPipeline:
             code = None
             policy = None
             diagnostic = None
+            timeout_kind = None
+            transport = None
+            call_timeout = asyncio.timeout(settings.call_timeout_seconds)
             try:
-                async with asyncio.timeout(settings.call_timeout_seconds):
+                async with call_timeout:
                     response = await provider.generate_structured(request=request)
                 if asyncio.get_running_loop().time() >= deadline:
                     raise LLMError("LLM_TIMEOUT")
+                if (
+                    endpoint_deadline is not None
+                    and asyncio.get_running_loop().time() >= endpoint_deadline
+                ):
+                    raise TimeoutError
                 if perf_counter() - start >= settings.call_timeout_seconds:
                     raise TimeoutError
                 if not isinstance(response, ProviderResponse):
@@ -711,7 +749,7 @@ class DualLLMPipeline:
                             diagnostic=OutputDiagnostic(reason="invalid_usage"),
                         )
                     usage = TokenUsage.model_validate(response.usage.model_dump(), strict=True)
-                    if usage.output_tokens > settings.max_output_tokens:
+                    if usage.output_tokens > request.max_output_tokens:
                         raise LLMError(
                             "LLM_OUTPUT_INVALID",
                             diagnostic=OutputDiagnostic(reason="output_token_limit"),
@@ -729,24 +767,63 @@ class DualLLMPipeline:
                 # Reject late results even if an adapter incorrectly swallowed cancellation.
                 if asyncio.get_running_loop().time() >= deadline:
                     raise LLMError("LLM_TIMEOUT")
+                if (
+                    endpoint_deadline is not None
+                    and asyncio.get_running_loop().time() >= endpoint_deadline
+                ):
+                    raise TimeoutError
                 if perf_counter() - start >= settings.call_timeout_seconds:
                     raise TimeoutError
                 return output
             except asyncio.CancelledError:
                 # External cancellation propagates; total deadline is converted by the caller.
                 code = "LLM_TIMEOUT"
+                if asyncio.get_running_loop().time() >= deadline:
+                    timeout_kind = "total_deadline"
+                elif (
+                    endpoint_deadline is not None
+                    and asyncio.get_running_loop().time() >= endpoint_deadline
+                ):
+                    timeout_kind = "endpoint_deadline"
+                transport = TransportDiagnostic(
+                    category="timeout", timeout_phase=timeout_kind or "unspecified"
+                )
                 raise
             except LLMError as exc:
                 code = exc.code
                 diagnostic = exc.diagnostic
+                if code == "LLM_TIMEOUT" and asyncio.get_running_loop().time() >= deadline:
+                    timeout_kind = "total_deadline"
+                if code == "LLM_TIMEOUT":
+                    transport = TransportDiagnostic(
+                        category="timeout", timeout_phase=timeout_kind or "unspecified"
+                    )
             except ValidationError:
                 code = "LLM_OUTPUT_INVALID"
                 diagnostic = OutputDiagnostic(reason="invalid_usage")
             except Exception as exc:
                 # Never serialize raw provider exceptions, headers, prompts, or secrets.
-                policy = recovery_policy(exc)
+                if asyncio.get_running_loop().time() >= deadline:
+                    timeout_kind = "total_deadline"
+                elif (
+                    endpoint_deadline is not None
+                    and asyncio.get_running_loop().time() >= endpoint_deadline
+                ):
+                    timeout_kind = "endpoint_deadline"
+                elif (
+                    call_timeout.expired()
+                    or perf_counter() - start >= settings.call_timeout_seconds
+                ):
+                    timeout_kind = "call_deadline"
+                if timeout_kind is not None:
+                    # 即使外掛吞取消再拋出可重試例外，已耗盡的生成期限仍優先終止。
+                    policy = RecoveryPolicy("LLM_TIMEOUT", False, True, timeout_kind=timeout_kind)
+                else:
+                    policy = recovery_policy(exc)
+                    timeout_kind = policy.timeout_kind
+                    diagnostic = output_diagnostic(exc)
                 code = policy.code
-                diagnostic = output_diagnostic(exc)
+                transport = provider_transport_diagnostic(exc, timeout_kind=timeout_kind)
                 if diagnostic is not None and diagnostic.category is None:
                     diagnostic.category = (
                         "output_truncated"
@@ -773,9 +850,38 @@ class DualLLMPipeline:
                         error_code=code,
                         diagnostic=diagnostic,
                         request_budget=budget,
+                        timeout_kind=timeout_kind,
+                        transport_diagnostic=transport,
+                        output_token_parameter=budget_settings.output_token_parameter,
+                        request_schema_sha256=hashlib.sha256(
+                            request.response_schema_json.encode("utf-8")
+                        ).hexdigest(),
+                        request_data_sha256=hashlib.sha256(
+                            request.data_json.encode("utf-8")
+                        ).hexdigest(),
+                        request_prompt_sha256=hashlib.sha256(
+                            request.system_prompt.encode("utf-8")
+                        ).hexdigest(),
                     )
                 )
-            if policy is None or not policy.retryable:
+            if policy is None:
+                raise LLMError(code, diagnostic=diagnostic)
+            if not policy.retryable:
+                # 終止生成等待仍清理本機連線；不再生成、不切其他端點抽取答案。
+                if policy.reset_connection:
+                    event = RecoveryEvent(
+                        stage=stage, after_attempt=offset + attempt, trigger_code=code
+                    )
+                    events.append(event)
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining > 0:
+                        await reset_connection(
+                            provider,
+                            event,
+                            min(settings.connection_reset_timeout_seconds, remaining),
+                        )
+                    else:
+                        event.retry_status = "deadline_exceeded"
                 raise LLMError(code, diagnostic=diagnostic)
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:

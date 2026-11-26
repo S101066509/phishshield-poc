@@ -8,15 +8,20 @@ from app.analysis.parser.limits import ParseLimits, require_limit
 
 NON_VISIBLE = {"script", "style", "template", "noscript", "head", "title"}
 BLOCKS = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "section", "hr"}
+ZERO_FONT_SIZES = {"0", "0px", "0pt", "0em", "0rem", "0%"}
 
 
-def is_hidden(tag: Tag) -> bool:
-    # Match complete property values; opacity:0.5 is visible, not opacity:0.
+def _inline_properties(tag: Tag) -> dict[str, str]:
     properties = {}
     for declaration in str(tag.get("style", "")).lower().split(";"):
         name, separator, value = declaration.partition(":")
         if separator:
             properties[name.strip()] = value.replace("!important", "").strip()
+    return properties
+
+
+def _hidden_container(tag: Tag, properties: dict[str, str]) -> bool:
+    # Match complete property values; opacity:0.5 is visible, not opacity:0.
     try:
         transparent = float(properties.get("opacity", "1").removesuffix("%")) == 0
     except ValueError:
@@ -29,6 +34,29 @@ def is_hidden(tag: Tag) -> bool:
         or properties.get("visibility") in {"hidden", "collapse"}
         or transparent
     )
+
+
+def is_hidden(tag: Tag) -> bool:
+    properties = _inline_properties(tag)
+    return (
+        _hidden_container(tag, properties)
+        or properties.get("font-size") in ZERO_FONT_SIZES
+        or properties.get("color") == "transparent"
+    )
+
+
+def _text_is_hidden(node: NavigableString) -> bool:
+    # Font/color inherit, so an explicit child style can override an ancestor's text style.
+    # Container hiding still applies through every ancestor; this remains static CSS approximation.
+    inherited = {}
+    for parent in node.parents:
+        properties = _inline_properties(parent)
+        if _hidden_container(parent, properties):
+            return True
+        for name in ("font-size", "color"):
+            if name not in inherited and properties.get(name) not in {None, "inherit", "unset"}:
+                inherited[name] = properties[name]
+    return inherited.get("font-size") in ZERO_FONT_SIZES or inherited.get("color") == "transparent"
 
 
 @dataclass
@@ -62,7 +90,7 @@ def extract_html(html: str, location: str, limits: ParseLimits) -> HTMLContent:
                 visible.append("\n")
         elif isinstance(node, NavigableString):
             text = str(node)
-            invisible = isinstance(node, Comment) or any(is_hidden(p) for p in node.parents)
+            invisible = isinstance(node, Comment) or _text_is_hidden(node)
             if invisible:
                 if text.strip():
                     hidden.append(text.strip())

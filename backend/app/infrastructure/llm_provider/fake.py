@@ -195,6 +195,26 @@ class FakeProvider(LangChainProvider):
                 for kind in KINDS
             ]
             if schema["properties"]["observations"].get("type") == "object":
+                if "RegistryReference" in schema.get("$defs", {}):
+                    # 僅現行八槽預設模擬挑選既存同類來源；腳本與舊格式不修補。
+                    for item in data["observations"]:
+                        prefixes = (
+                            ("url:",)
+                            if item["kind"] == "url_deception"
+                            else (
+                                "header:authentication-results:",
+                                "header:received-spf:",
+                                "header:dkim-signature:",
+                            )
+                            if item["kind"] == "authentication"
+                            else ()
+                        )
+                        if prefixes and item["assessment"] in {"observed", "uncertain"}:
+                            item["evidence_refs"] = [
+                                ref
+                                for ref in payload["evidence_catalog"]
+                                if ref.startswith(prefixes)
+                            ][:1]
                 data["observations"] = {
                     item["kind"]: {
                         "assessment": item["assessment"],

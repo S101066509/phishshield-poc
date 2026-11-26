@@ -13,6 +13,10 @@ from app.domain.email_models import URLFinding
 URL_PATTERN = re.compile(r"https?://[^\s<>\"'，。；、！？（）【】《》「」『』]+", re.IGNORECASE)
 RAW_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 PROSE_SEPARATORS = "，。；、！？（）【】《》「」『』"
+# 只免除標準全形 ASCII 標點與全形空白；英數及其他相容字形仍需覆核。
+COMMON_CJK_LAYOUT = frozenset(
+    "\u3000！＂＃＄％＆＇（）＊＋，－．／：；＜＝＞？＠［＼］＾＿｀｛｜｝～"
+)
 
 
 @dataclass
@@ -102,7 +106,12 @@ def unicode_signals(text: str) -> set[str]:
         for c in text
     ):
         signals.add("UNICODE_BIDI_CONTROLS")
-    if unicodedata.normalize("NFKC", text) != text:
+    if any(
+        not char.isascii()
+        and char not in COMMON_CJK_LAYOUT
+        and unicodedata.normalize("NFKC", char) != char
+        for char in text
+    ):
         signals.add("UNICODE_COMPATIBILITY_VARIANTS")
     if "\ufffd" in text:
         signals.add("DECODE_REPLACEMENT_PRESENT")

@@ -2,7 +2,9 @@
 
 目前範圍為本地展示／Demo POC MVP。Compose部署、資料庫更新與模型端點設定見 [README](../README.md)。API 路徑中的 `v1` 是路由名稱；目前版本為 **1.0.0**。請求與回應的完整欄位可在啟動後的 `/docs` 或 `/openapi.json` 查看。
 
-目前configured預設已回復 `IsolatedDualLLMPipeline`／`structured_dual`／`core_slots_1`八類觀察流程。事件方案保留歷史結果讀取支援，非現行預設；此次回復沒有重新執行真實郵件批次。
+configured模式使用 `IsolatedDualLLMPipeline`／`structured_dual`／`core_slots_1`八類觀察流程。模型A擷取觀察，程式轉為受控資料，再交由模型B判斷分類與支持理由；既有其他格式的分析紀錄可按原資料格式讀取。
+
+模型逾時仍回報未完成／UNKNOWN。失敗回覆的`model_diagnostics.calls`可含`latency_ms`、`timeout_kind`（connect／pool／read／write／unspecified／call_deadline／endpoint_deadline／total_deadline）、`output_token_parameter`及三項請求SHA-256指紋，供API除錯；不包含原文或模型回覆，也不呈現在讀者PDF正文。舊紀錄可能缺少這些欄位，不能推定當時的逾時來源。Connect／Pool timeout可有限重試，Read／Write／未知逾時及生成期限停止，不重送同一判斷。端點參數見[連接教學](project-endpoint-setup.md)。
 
 ## Swagger 與入口
 
@@ -127,6 +129,10 @@ curl -sS --max-time 310 http://127.0.0.1:8000/api/v1/analyses/file \
 
 `analysis_trace`的 `method`、`judgment_format`及交接contract區別資料形狀；目前版本都為1.0.0，不代表形狀相同。現行八槽trace保存 `structured_handoff_2`交接、evidence_map、`core_slots_1`決策及coverage。這些是工程資料，原文反向對照只留在後端保存及人員閱讀，不提供給B。
 
+有效UNKNOWN的`analysis_explanation.model.abstention`可包含程式從已驗證核心整理的棄權摘要：未提取到風險、已提取但未採用、已採用參考仍未形成結論。`summary`及`next_steps`是人員文字，`model_internal_reason_available=false`表示沒有模型內部理由；不改最終分類。舊資料或不適用時可缺欄，前端／PDF沿用rationale。
+
+工程用`model_diagnostics.calls[*].transport_diagnostic`可為null，或只含固定category、HTTP status、白名單parameter及timeout_phase；不含原始錯誤訊息／body／Key。503後恢復成功也可保留診斷，成功分類不因此改成失敗。舊缺值不回填，這些工程代碼不加入讀者報告正文。
+
 現行回覆的 `analysis_explanation.reason_source`與 `presentation.source`為 `deterministic_observations`。保留 `model.rationale`／`model.explanations`欄名是為閱讀相容；內容由程式依已驗證的核心、八類觀察及原文引用整理，**不是模型B原話，也未外部查證**。
 
 歷史 `structured_event_dual`／`event_facts_core_1`仍按事件契約閱讀，其trace可保存 `event_extraction_1`、`event_handoff_1`及事件決策，說明來源為 `deterministic_event_facts`。proposal與legacy也保留原義；讀取不改寫結果，不替八槽資料補造事件。事件方法不是configured預設，也不在八槽失敗時啟用。
@@ -135,15 +141,19 @@ curl -sS --max-time 310 http://127.0.0.1:8000/api/v1/analyses/file \
 
 `coverage`只表示normalized Registry的來源送達情況，不宣稱附件或全部raw EML已分析，也不表示A理解完整。事件歷史的 `analysis_reliability.semantic_extraction`另記availability、claimed_status、semantic_completeness、規範化前事件／關係數及factual_recall=unavailable；這些是當時受控紀錄，不是八槽新增事件計數，也不是人工事實召回率。未記錄表示unavailable，不補成完整提取。
 
-現行八槽SAFE須只明選NO_RISK_OBSERVED並綁定已檢視陰性觀察，沒有任何observed／uncertain，且來源與規則完整、無規則命中／警告／覆核。風險分類至少明選一項受支持的非authentication風險理由。A全陰性不代表已驗真安全；有效UNKNOWN可保留支持觀察，結構／引用／支持錯誤仍是FAILED，不轉為成功UNKNOWN。`format_recovery`固定disabled，沒有第三次說明模型。
+現行八槽SAFE須只明選NO_RISK_OBSERVED並綁定已檢視陰性觀察，沒有任何observed／uncertain，且來源與規則完整、無規則命中／警告／覆核。PHISHING至少明選一項受支持的非authentication模型風險理由；SUSPICIOUS亦可由有引用支持的RISKY_ATTACHMENT單獨成立，單獨附件訊號不能支持PHISHING。沒有具體userinfo／IP host指標的單獨uncertain網址觀察，不能支持這兩種風險分類。這些是程式檢查的最低支持資格，不代表已以程式完整強制B提示中的風險強度分級。A全陰性不代表已驗真安全；有效UNKNOWN可保留支持觀察，結構／引用／支持錯誤仍是FAILED，不轉為成功UNKNOWN。`format_recovery`固定disabled，沒有第三次說明模型。
+
+目前 B 的有效系統提示會在英文任務文字後附上本次完整輸出 Schema，內容與 `response_format` 相同；只含封閉 enum／引用代號，不新增郵件原文。呼叫診斷的 `request_prompt_sha256` 記錄含 Schema 的實際提示，因此會隨本次 Schema 改變；固定任務文字的指紋不是每筆有效提示指紋。預算中的 system 與 response schema 分別如實計算，輸出預留使用該階段實際額度。A／B 上限由後端 `.env` 分別設定，公開請求不能逐次覆寫。
+
+`FAILED`／`LLM_OUTPUT_INVALID` 且截斷診斷一致時，畫面與 PDF 會說明「模型輸出達長度上限，回覆未完成」。缺少歷史診斷或其他格式錯誤仍採一般未完成說明，不猜測原因，也不採用半份分類。
 
 診斷只保存固定原因、已知欄位路徑及計數，不保存 raw reply、例外、郵件值或思考。支持明細不含觀察／引用 ID；原文及 `analysis_trace` 則是另行保存的敏感資料。缺少歷史診斷表示未記錄，不能推定原因。
 
-## 系統提示語言追溯
+## 系統提示與診斷
 
-公開分析API仍只接受既有text／file與mode，不接受逐次提示語言或外部handoff。後端可信呼叫端可明確選A／B的en／zh-TW候選，預設均為英文，不從模型名稱自動切換，也沒有新增env設定或前端選單。中文效益尚未經真模型測試。
+目前A／B使用固定英文系統提示，不提供中文候選或提示語言切換，也不依模型名稱自動切換。公開分析API只接受既有text／file與mode，不接受逐次提示語言或外部handoff。
 
-已嘗試階段的`prompt_provenance`含availability與a／b的language、system_prompt_sha256，記錄實際送出的system身份；未執行階段為null。成功trace另保留同一追溯。歷史缺值表示未記錄，不推定英文；這些診斷metadata可隨API保存／閱讀，但不加入畫面報告或PDF。
+可用的模型呼叫診斷以`request_prompt_sha256`記錄實際送出提示的指紋；目前B的指紋包含本次輸出Schema。診斷可能未記錄或不可得，不由缺值推定當時提示。這些診斷資料供API除錯，不加入畫面報告或PDF。
 
 ## 歷史搜尋與閱讀
 

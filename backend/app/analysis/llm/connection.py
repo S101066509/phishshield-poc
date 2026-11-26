@@ -81,6 +81,9 @@ def endpoint_pools(settings: LLMSettings) -> dict[str, list[LLMSettings]]:
                     "thinking": entry.thinking
                     if "thinking" in entry.model_fields_set
                     else settings.thinking,
+                    "output_token_parameter": entry.output_token_parameter
+                    if "output_token_parameter" in entry.model_fields_set
+                    else settings.output_token_parameter,
                     "endpoints_a": None,
                     "endpoints_b": None,
                 }

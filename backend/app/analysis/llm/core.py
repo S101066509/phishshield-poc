@@ -1,7 +1,11 @@
 # 檔案功能：產生固定理由槽位的受限核心 Schema，並獨立驗證分類與支持，不生成說明。
 from typing import get_args
 
-from app.analysis.llm.reason_support import SUPPORT, eligible_observations, proposal_fields
+from app.analysis.llm.reason_support import (
+    SUPPORT,
+    eligible_observations,
+    proposal_fields,
+)
 from app.domain.handoff_models import DecodedCore, Reason, ReasonSupport
 
 CORE_NOTE = "核心判斷已通過驗證；人員說明由程式另行整理。"
@@ -42,13 +46,36 @@ def core_judgment(core):
     )
 
 
+def weak_uncertain_url(packet):
+    """True when url_deception is only uncertain without concrete program URL indicators."""
+    observation = next((item for item in packet.observations if item.kind == "url_deception"), None)
+    return (
+        observation is not None
+        and observation.assessment == "uncertain"
+        and not packet.url_userinfo_present
+        and not packet.url_ip_host_present
+    )
+
+
 def validate_core(core, packet, mapping, *, simulation=False):
     from app.analysis.llm.handoff import validate_judgment
 
     value = core_judgment(core)
-    if core.classification in {"PHISHING", "SUSPICIOUS"} and not any(
-        code in SUPPORT and code != "AUTHENTICATION_UNVERIFIED" for code in value.reason_codes
-    ):
+    uncertain_url_only = weak_uncertain_url(packet)
+    has_model_risk = any(
+        code in SUPPORT
+        and code != "AUTHENTICATION_UNVERIFIED"
+        and not (code == "URL_DECEPTION" and uncertain_url_only)
+        for code in value.reason_codes
+    )
+    has_attachment_risk = (
+        "RISKY_ATTACHMENT" in value.reason_codes
+        and packet.risky_attachment_extension
+        and bool(packet.risky_attachment_evidence_ids)
+    )
+    if core.classification == "PHISHING" and not has_model_risk:
+        raise ValueError("UNSUPPORTED_RISK")
+    if core.classification == "SUSPICIOUS" and not (has_model_risk or has_attachment_risk):
         raise ValueError("UNSUPPORTED_RISK")
     validate_judgment(value, packet, mapping, simulation=simulation)
     if core.classification == "SAFE" and not safe_eligible(packet):
@@ -63,7 +90,8 @@ def core_schema(packet, *, simulation=False):
     selectable = []
     risks = []
 
-    def binding(observation=None):
+    def binding(observation=None, *, evidence_ids=None):
+        refs = list(observation.evidence_ids) if observation else list(evidence_ids or ())
         return {
             "type": "object",
             "additionalProperties": False,
@@ -74,11 +102,11 @@ def core_schema(packet, *, simulation=False):
                 else {"type": "null"},
                 "evidence_refs": {
                     "type": "array",
-                    "items": {"type": "string", "enum": list(observation.evidence_ids)},
+                    "items": {"type": "string", "enum": refs},
                     "minItems": 1,
                     "maxItems": 4,
                 }
-                if observation
+                if refs
                 else {"type": "array", "items": {"type": "string"}, "maxItems": 0},
             },
         }
@@ -89,6 +117,12 @@ def core_schema(packet, *, simulation=False):
             if code in SUPPORT
             else []
         )
+        if (
+            code == "RISKY_ATTACHMENT"
+            and packet.risky_attachment_extension
+            and packet.risky_attachment_evidence_ids
+        ):
+            options = [binding(evidence_ids=packet.risky_attachment_evidence_ids)]
         if (
             code == "NO_RISK_OBSERVED"
             and not any(
@@ -102,8 +136,13 @@ def core_schema(packet, *, simulation=False):
         if options:
             definitions[code] = options[0] if len(options) == 1 else {"anyOf": options}
             selectable.append(code)
-            if code in SUPPORT and code != "AUTHENTICATION_UNVERIFIED":
+            if (
+                code in SUPPORT
+                and code != "AUTHENTICATION_UNVERIFIED"
+                and not (code == "URL_DECEPTION" and weak_uncertain_url(packet))
+            ):
                 risks.append(code)
+    attachment_risks = ["RISKY_ATTACHMENT"] if "RISKY_ATTACHMENT" in selectable else []
 
     def slots(witness, *, safe=False):
         properties = {}
@@ -144,11 +183,14 @@ def core_schema(packet, *, simulation=False):
             },
         }
 
-    branches = [decision(["UNKNOWN"], selectable)]
+    branches = []
     if risks:
         branches.append(decision(["PHISHING", "SUSPICIOUS"], risks))
+    if attachment_risks:
+        branches.append(decision(["SUSPICIOUS"], attachment_risks))
     if safe_eligible(packet):
         branches.append(decision(["SAFE"], ["NO_RISK_OBSERVED"], safe=True))
+    branches.append(decision(["UNKNOWN"], selectable))
     return {
         "title": "CoreResponse",
         "type": "object",
@@ -188,9 +230,16 @@ def check_schema_subset(schema):
     ):
         raise ValueError("SCHEMA_SUBSET_UNSUPPORTED")
 
+    defs = schema.get("$defs") if isinstance(schema.get("$defs"), dict) else {}
+
     def visit(node):
         if isinstance(node, dict):
             if any(key not in allowed for key in node):
+                raise ValueError("SCHEMA_SUBSET_UNSUPPORTED")
+            ref = node.get("$ref")
+            if ref is not None and (
+                not isinstance(ref, str) or not ref.startswith("#/$defs/") or ref[8:] not in defs
+            ):
                 raise ValueError("SCHEMA_SUBSET_UNSUPPORTED")
             for key, value in node.items():
                 if key in {"properties", "$defs"}:
@@ -201,6 +250,5 @@ def check_schema_subset(schema):
                 elif key == "anyOf":
                     for child in value:
                         visit(child)
-        return None
 
     visit(schema)

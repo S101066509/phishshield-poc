@@ -64,6 +64,29 @@ def validate_flat_support(value, packet):
     for code in dict.fromkeys(value.reason_codes):
         if value.reason_codes.count(code) > 1:
             violations.append(issue(code, "duplicate_reason"))
+        if code == "RISKY_ATTACHMENT":
+            available = set(packet.risky_attachment_evidence_ids)
+            supplied = set(value.evidence_refs)
+            condition = (
+                "assessment_not_supportive"
+                if not packet.risky_attachment_extension or not available
+                else "evidence_missing"
+                if not value.evidence_refs
+                else "evidence_not_linked"
+                if not available & supplied
+                else None
+            )
+            if condition:
+                violations.append(
+                    SupportViolation(
+                        reason_code=code,
+                        condition=condition,
+                        available_evidence_count=len(available),
+                        matching_evidence_count=len(supplied & available),
+                        invalid_evidence_count=len(supplied - available),
+                    )
+                )
+            continue
         if code not in SUPPORT:
             continue
         observation = next(
@@ -122,6 +145,38 @@ def validate_bound_support(value, packet):
         condition = None
         if code in seen:
             condition = "duplicate_reason"
+        elif code == "RISKY_ATTACHMENT":
+            available = set(packet.risky_attachment_evidence_ids)
+            supplied = set(unit.evidence_refs)
+            if unit.observation_id is not None:
+                condition = "observation_kind_mismatch"
+            elif not packet.risky_attachment_extension or not available:
+                condition = "assessment_not_supportive"
+            elif not unit.evidence_refs:
+                condition = "evidence_missing"
+            elif not supplied <= available:
+                condition = "evidence_not_linked"
+            if condition:
+                violations.append(
+                    SupportViolation(
+                        reason_code=code,
+                        condition=condition,
+                        observation_kind=observation.kind if observation else None,
+                        assessment=observation.assessment if observation else None,
+                        observation_selected=unit.observation_id
+                        in value.supporting_observation_ids,
+                        selected_kinds=[
+                            item.kind
+                            for item in packet.observations
+                            if item.id in value.supporting_observation_ids
+                        ],
+                        available_evidence_count=len(available),
+                        matching_evidence_count=len(supplied & available),
+                        invalid_evidence_count=len(supplied - available),
+                    )
+                )
+            seen.add(code)
+            continue
         elif unit.observation_id is not None and observation is None:
             condition = "observation_unknown"
         elif code in SUPPORT and observation is None:
@@ -185,6 +240,18 @@ def bound_support_schema(base, packet, *, simulation=False):
     for code in SUPPORT:
         for observation in eligible_observations(packet, code):
             branch(code, observation)
+    if packet.risky_attachment_extension and packet.risky_attachment_evidence_ids:
+        result = deepcopy(base)
+        props = result["properties"]
+        props["reason_code"] = {"type": "string", "const": "RISKY_ATTACHMENT"}
+        props["observation_id"] = {"type": "null"}
+        props["evidence_refs"] = {
+            "type": "array",
+            "maxItems": 100,
+            "items": {"type": "string", "enum": list(packet.risky_attachment_evidence_ids)},
+            "minItems": 1,
+        }
+        options.append(result)
     if not risks:
         for observation in packet.observations:
             if observation.evidence_ids:

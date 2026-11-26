@@ -1,9 +1,12 @@
-# 檔案功能：以來源目錄、角色引用與重複長字串池無損表示 A 材料，保留全部 Registry 引用。
+# 檔案功能：以來源目錄與角色引用無損表示 A 材料；短郵件內聯直讀，長郵件啟用字串池壓縮。
 import json
 from collections import Counter
 
 from app.analysis.llm.evidence_catalog import evidence_catalog
 from app.domain.reliability_models import InputCoverage
+
+# 短郵件低於此位元組門檻時維持直接內聯值，減少 4B 小模型在 source_values/catalog_ref 間跳轉負擔。
+COMPACT_INDIRECTION_THRESHOLD_BYTES = 100_000
 
 
 def coverage_for_mail(mail):
@@ -17,13 +20,60 @@ def coverage_for_mail(mail):
     )
 
 
-def compact_input(mail, rules):
+def compact_input(mail, rules, *, indirection_threshold_bytes=COMPACT_INDIRECTION_THRESHOLD_BYTES):
     original = evidence_catalog(mail)
     # URL/attachment registry strings are structured JSON. Body/headers remain exact strings.
     catalog = {
         ref: json.loads(value) if ref.startswith(("url:", "attachment:")) else value
         for ref, value in original.items()
     }
+    base_roles = {
+        "body_refs": [ref for ref in original if ref.startswith("body:")],
+        "headers": {
+            name: [f"header:{name}:{i}" for i in range(len(values))]
+            for name, values in mail.headers.items()
+        },
+        "urls": [ref for ref in original if ref.startswith("url:")],
+        "attachments_metadata": [ref for ref in original if ref.startswith("attachment:")],
+        "hidden_refs": [ref for ref in original if ref.startswith("hidden:")],
+        "auth_results": mail.auth_results.model_dump(mode="json"),
+        "parse_warnings": mail.parse_warnings,
+    }
+    rules_payload = {
+        "findings": [
+            item.model_dump(
+                mode="json", include={"rule_id", "category", "severity", "evidence_refs"}
+            )
+            for item in rules.findings
+        ],
+        "reviews": [
+            item.model_dump(mode="json", include={"code", "evidence_refs"})
+            for item in rules.review_items
+        ],
+    }
+    coverage_payload = coverage_for_mail(mail).model_dump(mode="json")
+
+    inline_payload = {
+        "input_contract": "compact_mail_1",
+        "email": {
+            **base_roles,
+            "sender_normalized": mail.sender,
+            "reply_to_normalized": mail.reply_to,
+            "subject": mail.subject,
+        },
+        "rules": rules_payload,
+        "evidence_catalog": catalog,
+        "source_values": {},
+        "coverage": coverage_payload,
+    }
+    inline_bytes = len(
+        json.dumps(inline_payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    )
+    if inline_bytes < indirection_threshold_bytes:
+        if restore_catalog(inline_payload) != original:
+            raise ValueError("COMPACT_CATALOG_MISMATCH")
+        return inline_payload
+
     counts = Counter()
 
     def count(value):
@@ -52,30 +102,18 @@ def compact_input(mail, rules):
             return [intern(item) for item in value]
         return value
 
-    roles = {
-        "body_refs": [ref for ref in original if ref.startswith("body:")],
-        "headers": {
-            name: [f"header:{name}:{i}" for i in range(len(values))]
-            for name, values in mail.headers.items()
-        },
-        "urls": [ref for ref in original if ref.startswith("url:")],
-        "attachments_metadata": [ref for ref in original if ref.startswith("attachment:")],
-        "hidden_refs": [ref for ref in original if ref.startswith("hidden:")],
-        "auth_results": mail.auth_results.model_dump(mode="json"),
-        "parse_warnings": mail.parse_warnings,
-    }
-
     def derived(value):
         if value is None:
             return None
         reference = next((ref for ref, text in original.items() if text == value), None)
         return {"evidence_ref": reference} if reference else value
 
-    roles.update(
-        sender_normalized=derived(mail.sender),
-        reply_to_normalized=derived(mail.reply_to),
-        subject=derived(mail.subject),
-    )
+    roles = {
+        **base_roles,
+        "sender_normalized": derived(mail.sender),
+        "reply_to_normalized": derived(mail.reply_to),
+        "subject": derived(mail.subject),
+    }
     packed = intern(catalog)
     canonical = {}
     for ref, text in original.items():
@@ -87,21 +125,10 @@ def compact_input(mail, rules):
     payload = {
         "input_contract": "compact_mail_1",
         "email": roles,
-        "rules": {
-            "findings": [
-                item.model_dump(
-                    mode="json", include={"rule_id", "category", "severity", "evidence_refs"}
-                )
-                for item in rules.findings
-            ],
-            "reviews": [
-                item.model_dump(mode="json", include={"code", "evidence_refs"})
-                for item in rules.review_items
-            ],
-        },
+        "rules": rules_payload,
         "evidence_catalog": packed,
         "source_values": pool,
-        "coverage": coverage_for_mail(mail).model_dump(mode="json"),
+        "coverage": coverage_payload,
     }
     if restore_catalog(payload) != original:
         raise ValueError("COMPACT_CATALOG_MISMATCH")

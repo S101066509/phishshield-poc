@@ -18,6 +18,7 @@ cp -n .env.example .env
 | `model` | 服務提供的完整模型 ID，須精確匹配，不自動補 `:latest` |
 | `api_key` | 原始金鑰，不加`Bearer `前綴；本機服務不需要認證時可留空 |
 | `thinking` | `false`請求關閉思考、`true`請求中等思考、`null`沿用服務預設 |
+| `output_token_parameter` | 輸出上限的HTTP欄位名，選`max_tokens`或`max_completion_tokens`；Ollama 0.40.x使用前者，省略時預設後者 |
 
 服務除了 Chat Completions，還須支援本系統使用的嚴格 JSON Schema 輸出。請依下列本機或外部服務範例設定。
 
@@ -33,13 +34,24 @@ curl -sS http://127.0.0.1:11434/v1/models
 若 Ollama 尚未執行，在另一個終端機執行 `ollama serve`；已有背景服務時不必重複啟動。以下使用 `gemma4:e4b` 作範例，請填入自己的實際模型 ID：
 
 ```dotenv
-PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false}]'
-PHISHSHIELD_LLM_ENDPOINTS_B='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false}]'
+PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false,"output_token_parameter":"max_tokens"}]'
+PHISHSHIELD_LLM_ENDPOINTS_B='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false,"output_token_parameter":"max_tokens"}]'
 PHISHSHIELD_LLM_TEMPERATURE=0
 PHISHSHIELD_LLM_SEED=42
 ```
 
 Compose 不會替你安裝模型權重或啟動 Ollama。容器啟動時會將上述 HTTP loopback 位址轉為 `host.docker.internal`，只改容器程序中的設定，原 `.env` 不改寫。原生 Python 啟動則直接使用原 loopback 位址。
+
+`output_token_parameter`只決定把當次 A／B 的有效輸出額度送到哪個欄位，不是另一個數量設定。程式不依模型名或服務商標籤猜測，也不會把兩欄一起送出。外部API省略時使用`max_completion_tokens`；若服務規格要求`max_tokens`，可在該組端點明確指定。進階程式共用設定`PHISHSHIELD_LLM_OUTPUT_TOKEN_PARAMETER`可供未指定此欄的端點繼承，通常直接在端點JSON設定即可。
+
+A／B 額度直接寫在同一份根 `.env`，例如：
+
+```dotenv
+PHISHSHIELD_LLM_MAX_OUTPUT_TOKENS_A=4096
+PHISHSHIELD_LLM_MAX_OUTPUT_TOKENS_B=8192
+```
+
+這是分開調整額度的範例，不是速度或成功保證；範本預設仍為 A／B 各 2,048。每項接受 1–16,384，同階段全部備援沿用同一額度。未設的階段才回退至舊相容設定 `PHISHSHIELD_LLM_MAX_OUTPUT_TOKENS`（預設 2,048），不是加總或每端點另配額。額度、輸出 bytes、輸入／完整請求 bytes、context 預留與總期限都仍獨立檢查；只提高額度不能修復所有截斷或生成停滯。
 
 **主機可連到 Ollama，不代表容器一定可連到。** Docker Desktop需能從容器存取主機服務；Linux Docker Engine的host-gateway路由與Ollama監聽位址亦須相符。若後續顯示offline，先檢查這條容器到主機的連線，不要把模型位址改成Compose的PostgreSQL服務名。
 
@@ -63,10 +75,10 @@ PHISHSHIELD_LLM_ENDPOINTS_B='[{"endpoint":"https://api.example.com/v1","model":"
 每階段可設1–10組，依陣列順序嘗試。例如A先用本機，再用外部備援：
 
 ```dotenv
-PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false},{"endpoint":"https://backup.example.com/v1","model":"remote-model-id","api_key":"YOUR_API_KEY","thinking":null}]'
+PHISHSHIELD_LLM_ENDPOINTS_A='[{"endpoint":"http://127.0.0.1:11434/v1","model":"gemma4:e4b","api_key":"","thinking":false,"output_token_parameter":"max_tokens"},{"endpoint":"https://backup.example.com/v1","model":"remote-model-id","api_key":"YOUR_API_KEY","thinking":null}]'
 ```
 
-B需獨立設定自己的陣列。暫時斷線、逾時及可恢復服務錯誤才會有限重試／備援；認證、輸出格式、引用或支持驗證失敗不會透過換端點重新抽答案。全部嘗試共用期限，不是每組端點各自取得完整期限。
+B需獨立設定自己的陣列。暫時斷線、建立連線逾時、容量不足及可恢復服務錯誤可有限重試／備援。讀取／寫入逾時、單次／端點／總生成期限或無法確認來源的timeout會停止，避免相同生成工作再次執行；認證、輸出格式、引用或支持驗證失敗亦不換端點抽答案。全部嘗試共用期限，不是每組端點各自取得完整期限。
 
 ## 3. 套用設定
 

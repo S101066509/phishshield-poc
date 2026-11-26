@@ -40,6 +40,19 @@ def build_deterministic_model(models, evidence, labels, uncertainty_labels):
         "analysis_override": "請對照試圖影響分析的文字與其他郵件內容。",
     }
     for unit in models.structured_judgment.reason_supports or []:
+        if unit.reason_code == "RISKY_ATTACHMENT":
+            explanations.append(
+                dict(
+                    category="risky_attachment",
+                    assessment="observed",
+                    explanation=(
+                        "規則標示「高風險附件副檔名」（僅依檔名中繼資料，未開啟或分析內容）；"
+                        "請核對所引附件並透過既有聯絡管道確認來源。"
+                    ),
+                    evidence_refs=[mapping[ref] for ref in unit.evidence_refs],
+                )
+            )
+            continue
         observation = by_id.get(unit.observation_id)
         if not observation or unit.reason_code in {
             "NO_RISK_OBSERVED",
@@ -79,9 +92,26 @@ def build_deterministic_model(models, evidence, labels, uncertainty_labels):
                 and item.reason_code not in {"EVIDENCE_INSUFFICIENT", "NO_RISK_OBSERVED"}
             )
         )
-        output["rationale"] = (
-            "核心依模型擷取的"
-            + "、".join(kinds)
-            + "訊號提出風險建議；請核對所引原文，並透過既有聯絡管道確認。"
+        has_attachment = any(
+            item.reason_code == "RISKY_ATTACHMENT"
+            for item in models.structured_judgment.reason_supports
         )
+        if kinds and has_attachment:
+            output["rationale"] = (
+                "核心依模型擷取的"
+                + "、".join(kinds)
+                + "訊號及規則標示的高風險附件副檔名提出風險建議；"
+                "請核對所引原文，並透過既有聯絡管道確認。"
+            )
+        elif has_attachment:
+            output["rationale"] = (
+                "核心依規則標示的高風險附件副檔名（僅依檔名中繼資料，未分析內容）提出風險建議；"
+                "請核對所引附件，並透過既有聯絡管道確認。"
+            )
+        else:
+            output["rationale"] = (
+                "核心依模型擷取的"
+                + "、".join(kinds)
+                + "訊號提出風險建議；請核對所引原文，並透過既有聯絡管道確認。"
+            )
     return output

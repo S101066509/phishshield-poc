@@ -34,7 +34,7 @@ def request_budget(request, settings, payload):
                     "schema": json.loads(request.response_schema_json),
                 },
             },
-            "max_completion_tokens": request.max_output_tokens,
+            settings.output_token_parameter: request.max_output_tokens,
             "stream": False,
             "reasoning_effort": "medium",
             "temperature": settings.temperature,
